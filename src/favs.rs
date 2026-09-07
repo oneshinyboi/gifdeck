@@ -56,9 +56,9 @@ impl FavItem {
     }
 }
 
-/// Wall-clock seconds since the Unix epoch, as the local store's
-/// `added_at` timestamp (kept opaque; nothing parses it back).
-fn now_epoch() -> String {
+/// Wall-clock seconds since the Unix epoch, as a timestamp (kept opaque;
+/// nothing parses it back).
+pub(crate) fn now_epoch() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
@@ -74,9 +74,11 @@ pub struct FavsPage {
     pub total: Option<usize>,
 }
 
-/// Response shape of `PATCH /favorites/{id}/use`.
+/// Response shape of `PATCH /favorites/{id}/use`. Returned by
+/// `FavsBackend::increment_use` for symmetry with the server; callers
+/// currently ignore it (tests consume the fields).
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // consumed by later sessions when use-tracking is surfaced in the TUI
+#[allow(dead_code)]
 pub struct UseCount {
     pub id: String,
     #[serde(default)]
@@ -106,9 +108,12 @@ impl FavsClient {
             .timeout(TIMEOUT)
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build http client: {e}"))?;
+        let base = cfg.favorites_api().ok_or_else(|| {
+            anyhow::anyhow!("GIFDECK_FAVORITES_API is not configured (required in server mode)")
+        })?;
         Ok(FavsClient {
             http,
-            base: cfg.favorites_api().trim_end_matches('/').to_string(),
+            base: base.trim_end_matches('/').to_string(),
             token: cfg.favorites_token.clone(),
         })
     }
@@ -189,7 +194,6 @@ impl FavsClient {
     }
 
     /// PATCH /favorites/{id}/use → increment usage.
-    #[allow(dead_code)] // wired up in later sessions (use-tracking on pick)
     pub async fn increment_use(&self, id: &str) -> anyhow::Result<UseCount> {
         let path = urlenc(id);
         let resp = self
@@ -324,6 +328,23 @@ impl FavsBackend {
         match self {
             FavsBackend::Server(client) => client.delete(id).await,
             FavsBackend::Local(store) => store.remove(id),
+        }
+    }
+
+    /// Record a "use" of a favorite: bump `use_count` and set `last_used`
+    /// (PATCH /favorites/{id}/use on the server; a persisted update in the
+    /// local store). A missing id is a silent no-op on the local backend.
+    pub async fn increment_use(&self, id: &str) -> anyhow::Result<UseCount> {
+        match self {
+            FavsBackend::Server(client) => client.increment_use(id).await,
+            FavsBackend::Local(store) => {
+                let item = store.increment_use(id)?;
+                Ok(UseCount {
+                    id: item.id,
+                    use_count: item.use_count,
+                    last_used: item.last_used,
+                })
+            }
         }
     }
 }
@@ -584,8 +605,10 @@ mod tests {
             FavsBackend::Server(_)
         ));
 
-        // An unset mode keeps the token-presence default.
+        // An unset mode keeps the token-presence default (server mode
+        // requires a configured API base).
         let cfg = Config {
+            favorites_api: Some("http://cfg-server/api".into()),
             favorites_token: Some("tok".into()),
             ..Config::default()
         };
@@ -593,6 +616,17 @@ mod tests {
             FavsBackend::from_config(&cfg),
             FavsBackend::Server(_)
         ));
+
+        // Token set but no API base configured: server mode is
+        // impossible, so the local store is used.
+        let cfg = Config {
+            favorites_token: Some("tok".into()),
+            ..Config::default()
+        };
+        assert!(
+            FavsBackend::from_config(&cfg).is_local(),
+            "server mode requires GIFDECK_FAVORITES_API"
+        );
     }
 
     #[tokio::test]
@@ -638,6 +672,31 @@ mod tests {
         let items = backend.list().await.unwrap();
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|f| f.id != "b1"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn local_backend_increment_use_persists() {
+        let (store, path) = local_store();
+        let backend = FavsBackend::Local(store.clone());
+        backend.save(&test_gif()).await.unwrap();
+
+        let first = backend.increment_use("abc123").await.unwrap();
+        assert_eq!(first.id, "abc123");
+        assert_eq!(first.use_count, 1);
+        assert!(first.last_used.is_some());
+
+        let second = backend.increment_use("abc123").await.unwrap();
+        assert_eq!(second.use_count, 2);
+
+        // Missing id is a silent no-op.
+        let noop = backend.increment_use("nope").await.unwrap();
+        assert_eq!(noop.use_count, 0);
+
+        let items = store.load().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].use_count, 2, "bumps persisted");
 
         let _ = std::fs::remove_file(&path);
     }

@@ -24,13 +24,7 @@ Not yet implemented (next session): public readiness.
    flow (Tab → Favorites, toggle against the local store) has only been
    verified via unit tests (`toggle_local_backend_*`), not driven in a
    live terminal session.
-2. **Wire `increment_use` on pick** — `FavsClient::increment_use`
-   (`PATCH /favorites/{id}/use`) is still dead code. When a picked/copied
-   GIF is a favorite, bump its `use_count`/`last_used`. Needs: a decision
-   on what counts as a "use" (Enter/Space pick only, or also `c`/`y`
-   copies), an `increment_use` on `FavsBackend`/`LocalStore` so local
-   mode has semantics too, and possibly sort-by-use later.
-3. **`favs --import` failure detail** — import currently reports only a
+2. **`favs --import` failure detail** — import currently reports only a
    summary count ("imported N/M"); it should say which favorites failed
    and why.
 
@@ -78,12 +72,14 @@ search box — start typing.
 Favorites have exactly one home, picked by the config — the two stores
 are alternatives, never a fallback for one another:
 
-- **Server mode** (default when `GIFDECK_FAVORITES_TOKEN` is configured):
-  favorites live on the self-hosted server
-  (`https://favs.veryshiny.net/api/v1` by default, `X-Auth-Token` auth).
-- **Local mode** (no token configured): favorites live in a plain JSON
-  file at `~/.local/share/gifdeck/favorites.json` — no server needed,
-  which is also gifdeck's out-of-the-box story.
+- **Server mode** (default when `GIFDECK_FAVORITES_TOKEN` is configured,
+  and requiring `GIFDECK_FAVORITES_API` to point at the server's base
+  URL, e.g. `https://your-host/api/v1`; `X-Auth-Token` auth): favorites
+  live on the self-hosted server.
+- **Local mode** (no token configured, or no API base configured):
+  favorites live in a plain JSON file at
+  `~/.local/share/gifdeck/favorites.json` — no server needed, which is
+  also gifdeck's out-of-the-box story.
 
 The picker shows which mode it's in (`v favorite · local favorites` in
 the footer) and `v` toggles against the active backend instantly. The
@@ -125,7 +121,8 @@ d / u               next / previous page (the ONLY paging keys —
 /                   focus the search box (Search tab)
 (type…)             edit the query — Backspace deletes, Ctrl+U clears,
                     Esc clears then blurs; search runs on Enter only
-Enter               run the search / choose the selected GIF (prints its URL)
+Enter               run the search / choose the selected GIF (prints its URL;
+                    a chosen favorite gets its use count bumped)
 Space               choose the selected GIF
 Tab                 switch between Search and Favorites
 c                   copy the GIF FILE to the clipboard as image/gif
@@ -171,6 +168,17 @@ On select (Enter/Space) the URL is printed and copied to the clipboard
 when `wl-copy` or `xclip` is installed. The TUI requires a terminal;
 over a non-TTY it exits with an error.
 
+### Use tracking
+
+Using a *favorited* GIF bumps its use stats on the active backend
+(`PATCH /favorites/{id}/use` on the server — `use_count += 1`,
+`last_used = now`; a persisted update in the local store). What counts
+as a use: picking (Enter/Space), copying the GIF file (`c`), and copying
+the URL (`y`). Non-favorites are ignored, and a failed bump surfaces in
+the footer without disturbing the pick/copy result. The server sorts its
+list by `use_count` (desc), so favorites you actually use float to the
+top of the Favorites tab.
+
 ## Configuration
 
 Configuration is read once per process from the gifdeck config file:
@@ -187,7 +195,7 @@ configuration values):
 | ------------------------ | -------------------------------- |
 | `KLIPY_API_KEY`          | KLIPY search API key             |
 | `GIPHY_API_KEY`          | GIPHY search API key             |
-| `GIFDECK_FAVORITES_API`  | favorites server base URL        |
+| `GIFDECK_FAVORITES_API`  | favorites server base URL (required in server mode; no default) |
 | `GIFDECK_FAVORITES_TOKEN`| favorites server auth token      |
 | `FAVORITES_MODE`         | explicit favorites mode: `server` \| `local` |
 

@@ -30,9 +30,6 @@ pub struct Config {
     pub favorites_mode: Option<String>,
 }
 
-/// Default favorites API base when not configured.
-pub const DEFAULT_FAVORITES_API: &str = "https://favs.veryshiny.net/api/v1";
-
 /// Resolved once per process.
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
@@ -120,11 +117,10 @@ fn favorites_mode(raw: &Option<String>) -> Option<String> {
 }
 
 impl Config {
-    /// Favorites API base URL.
-    pub fn favorites_api(&self) -> &str {
-        self.favorites_api
-            .as_deref()
-            .unwrap_or(DEFAULT_FAVORITES_API)
+    /// Favorites API base URL, when configured. There is no default —
+    /// server mode requires an explicit `GIFDECK_FAVORITES_API`.
+    pub fn favorites_api(&self) -> Option<&str> {
+        self.favorites_api.as_deref()
     }
 
     /// Whether favorites live on the self-hosted server. An explicit

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::favs::FavItem;
+use crate::favs::{FavItem, now_epoch};
 use crate::providers::GifResult;
 
 #[derive(Debug, Clone)]
@@ -113,6 +113,30 @@ impl LocalStore {
             self.save_all(&items)?;
         }
         Ok(())
+    }
+
+    /// Record a "use" of a favorite: bump `use_count` and set `last_used`.
+    /// Missing id is a silent no-op (nothing to count); the updated stats
+    /// are returned so callers can surface them if they ever want to.
+    pub fn increment_use(&self, id: &str) -> Result<FavItem> {
+        let mut items = self.load()?;
+        let Some(existing) = items.iter_mut().find(|f| f.id == id) else {
+            return Ok(FavItem {
+                id: id.to_string(),
+                url: String::new(),
+                preview: String::new(),
+                provider: String::new(),
+                title: String::new(),
+                use_count: 0,
+                added_at: None,
+                last_used: None,
+            });
+        };
+        existing.use_count = existing.use_count.saturating_add(1);
+        existing.last_used = Some(now_epoch());
+        let updated = existing.clone();
+        self.save_all(&items)?;
+        Ok(updated)
     }
 }
 
@@ -233,5 +257,47 @@ mod tests {
         assert_eq!(items[0].id, "b");
         s.remove("nope").unwrap();
         assert_eq!(s.load().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn increment_use_bumps_and_persists() {
+        let (s, _) = store_named("use-bump");
+        let fav = s.upsert(&gif("a")).unwrap();
+        assert_eq!(fav.use_count, 0);
+        assert!(fav.last_used.is_none());
+
+        let first = s.increment_use("a").unwrap();
+        assert_eq!(first.use_count, 1);
+        assert!(first.last_used.is_some());
+
+        let second = s.increment_use("a").unwrap();
+        assert_eq!(second.use_count, 2);
+
+        let items = s.load().unwrap();
+        assert_eq!(items[0].use_count, 2, "bump is persisted");
+        assert_eq!(items[0].last_used, first.last_used);
+        // added_at is preserved, like upsert does.
+        assert_eq!(items[0].added_at, fav.added_at);
+    }
+
+    #[test]
+    fn increment_use_missing_id_is_a_noop() {
+        let (s, _) = store_named("use-missing");
+        s.upsert(&gif("a")).unwrap();
+        let noop = s.increment_use("nope").unwrap();
+        assert_eq!(noop.id, "nope");
+        assert_eq!(noop.use_count, 0);
+        assert!(noop.last_used.is_none());
+        let items = s.load().unwrap();
+        assert_eq!(items.len(), 1, "no entry created");
+        assert_eq!(items[0].use_count, 0, "existing entry untouched");
+    }
+
+    #[test]
+    fn increment_use_refuses_damaged_store() {
+        let (s, path) = store_named("use-damaged");
+        std::fs::write(&path, "{ broken").unwrap();
+        assert!(s.increment_use("a").is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

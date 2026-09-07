@@ -117,7 +117,7 @@ pub struct GridState {
 
 /// Deferred work queued by `handle_key` and executed by the event loop
 /// (all of it needs the network, so none of it can run synchronously).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pending {
     /// Fetch the neighbor page (d / u).
     Page(PageDir),
@@ -129,6 +129,8 @@ pub enum Pending {
     CopyGif,
     /// Copy the selected GIF's URL as text (y).
     CopyUrl,
+    /// Record a "use" of a favorite by id (pick / c / y).
+    Use(String),
     /// Tab was switched: refresh favorite IDs, load the favorites page if
     /// the tab has never been populated.
     TabLoad,
@@ -565,9 +567,13 @@ impl App {
     }
 
     fn choose(&mut self) {
-        if let Some(item) = self.active_item() {
-            self.selected_url = Some(item.url.clone());
+        let id = self.active_item().map(|i| (i.id.clone(), i.url.clone()));
+        if let Some((id, url)) = id {
+            self.selected_url = Some(url);
             self.should_quit = true;
+            // A pick counts as a use; the event loop runs this before it
+            // honors should_quit.
+            self.pending = Some(Pending::Use(id));
         }
     }
 
@@ -769,20 +775,42 @@ impl App {
             return;
         };
         match clipboard::copy_gif_file(&self.http, &item.url).await {
-            Ok(()) => self.status = Some("copied GIF to clipboard".into()),
+            Ok(()) => {
+                self.status = Some("copied GIF to clipboard".into());
+                self.record_use(&item.id).await;
+            }
             Err(e) => self.status = Some(format!("copy failed: {e}")),
         }
     }
 
     /// Copy the selected GIF's URL as text (the "paste URL → animated
-    /// embed" path).
-    fn copy_url(&mut self) {
+    /// embed" path). Returns whether the copy succeeded.
+    fn copy_url(&mut self) -> bool {
         let Some(item) = self.active_item().cloned() else {
-            return;
+            return false;
         };
         match clipboard::copy_text(&item.url) {
-            Ok(()) => self.status = Some("copied URL".into()),
-            Err(e) => self.status = Some(format!("copy failed: {e}")),
+            Ok(()) => {
+                self.status = Some("copied URL".into());
+                true
+            }
+            Err(e) => {
+                self.status = Some(format!("copy failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Count a "use" of a favorited GIF (pick, copied GIF, copied URL):
+    /// bumps `use_count`/`last_used` on the active backend. Non-favorites
+    /// are ignored and errors never crash the picker (they surface in the
+    /// footer when there is one left to show — a pick quits immediately).
+    async fn record_use(&mut self, id: &str) {
+        if !self.fav_ids.contains(id) {
+            return;
+        }
+        if let Err(e) = self.favs.increment_use(id).await {
+            self.status = Some(format!("use bump failed: {e}"));
         }
     }
 
@@ -1260,7 +1288,15 @@ pub async fn run(mut app: App) -> Result<Option<String>> {
                     app.copy_gif().await;
                 }
                 Some(Pending::CopyUrl) => {
-                    app.copy_url();
+                    if app.copy_url() {
+                        let id = app.active_item().map(|i| i.id.clone());
+                        if let Some(id) = id {
+                            app.record_use(&id).await;
+                        }
+                    }
+                }
+                Some(Pending::Use(id)) => {
+                    app.record_use(&id).await;
                 }
                 Some(Pending::TabLoad) => {
                     app.load_tab().await;
@@ -1985,6 +2021,123 @@ mod tests {
         assert!(app.fav_ids.is_empty(), "a damaged store must not be toggled");
         let status = app.status.as_deref().unwrap();
         assert!(status.contains("favorite failed"), "got: {status}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn pick_of_favorite_queues_use_and_records_it() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/favorites/id0/use"))
+            .and(wiremock::matchers::header("X-Auth-Token", "sekret"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "id0",
+                "use_count": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = cfg_for(&server.uri());
+        let mut app = App::new(
+            cfg.clone(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            server_backend(&cfg),
+        );
+        app.search.items = items(1);
+        app.fav_ids.insert("id0".into());
+
+        app.choose();
+        assert_eq!(app.selected_url.as_deref(), Some("https://gifdeck.test/0.gif"));
+        assert!(app.should_quit);
+        assert_eq!(app.pending, Some(Pending::Use("id0".into())));
+
+        // The event loop honors Pending::Use before should_quit.
+        if let Some(Pending::Use(id)) = app.pending.take() {
+            app.record_use(&id).await;
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn use_of_non_favorite_makes_no_request() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/favorites/id0/use"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cfg = cfg_for(&server.uri());
+        let mut app = App::new(
+            cfg.clone(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            server_backend(&cfg),
+        );
+        app.search.items = items(1);
+
+        app.choose();
+        assert_eq!(app.pending, Some(Pending::Use("id0".into())));
+        if let Some(Pending::Use(id)) = app.pending.take() {
+            app.record_use(&id).await;
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn use_bump_error_surfaces_in_status() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/favorites/id0/use"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(502)
+                    .set_body_json(serde_json::json!({"error": "upstream down"})),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = cfg_for(&server.uri());
+        let mut app = App::new(
+            cfg.clone(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            server_backend(&cfg),
+        );
+        app.search.items = items(1);
+        app.fav_ids.insert("id0".into());
+
+        app.record_use("id0").await;
+        let status = app.status.as_deref().unwrap();
+        assert!(status.contains("use bump failed"), "got: {status}");
+        assert!(status.contains("502"), "got: {status}");
+    }
+
+    #[tokio::test]
+    async fn record_use_on_local_backend_persists_bump() {
+        let path = local_store_path();
+        let backend = FavsBackend::Local(LocalStore::at(&path));
+        backend.save(&items(1)[0].to_gif_result()).await.unwrap();
+
+        let mut app = App::new(
+            Config::default(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            backend,
+        );
+        app.search.items = items(1);
+        app.fav_ids.insert("id0".into());
+
+        app.record_use("id0").await;
+        assert!(
+            app.status.is_none(),
+            "a successful bump leaves the footer alone"
+        );
+        let stored = LocalStore::at(&path).load().unwrap();
+        assert_eq!(stored[0].use_count, 1);
+        assert!(stored[0].last_used.is_some());
         let _ = std::fs::remove_file(&path);
     }
 
