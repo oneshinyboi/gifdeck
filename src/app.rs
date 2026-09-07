@@ -1344,6 +1344,7 @@ mod tests {
             giphy_api_key: None,
             favorites_api: Some(base.to_string()),
             favorites_token: Some("sekret".to_string()),
+            favorites_mode: None,
         }
     }
 

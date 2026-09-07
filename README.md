@@ -30,11 +30,7 @@ Not yet implemented (next session): public readiness.
    on what counts as a "use" (Enter/Space pick only, or also `c`/`y`
    copies), an `increment_use` on `FavsBackend`/`LocalStore` so local
    mode has semantics too, and possibly sort-by-use later.
-3. **Explicit favorites-mode override** — mode is purely
-   token-presence-based. A `FAVORITES_MODE` config key (server|local)
-   would let someone run the local store while keeping server
-   credentials in the config.
-4. **`favs --import` failure detail** — import currently reports only a
+3. **`favs --import` failure detail** — import currently reports only a
    summary count ("imported N/M"); it should say which favorites failed
    and why.
 
@@ -99,7 +95,8 @@ only crossover between the two stores is explicit:
   id; idempotent)
 
 So switching modes is a two-step choice: transfer with `--export`/`--import`,
-then add or remove `GIFDECK_FAVORITES_TOKEN` from the config.
+then either set `"FAVORITES_MODE": "local"` in the config (keeping the
+token for later), or remove `GIFDECK_FAVORITES_TOKEN`.
 
 ## TUI
 
@@ -183,7 +180,8 @@ Configuration is read once per process from the gifdeck config file:
 ```
 
 Override the path with the `GIFDECK_CONFIG` environment variable pointing at
-an alternate file. Keys and env vars:
+an alternate file. Keys (the config file is the only source of
+configuration values):
 
 | Key                      | Meaning                          |
 | ------------------------ | -------------------------------- |
@@ -191,15 +189,18 @@ an alternate file. Keys and env vars:
 | `GIPHY_API_KEY`          | GIPHY search API key             |
 | `GIFDECK_FAVORITES_API`  | favorites server base URL        |
 | `GIFDECK_FAVORITES_TOKEN`| favorites server auth token      |
+| `FAVORITES_MODE`         | explicit favorites mode: `server` \| `local` |
 
 The token decides the favorites mode: set → server, unset → local store
-(see [Favorites storage](#favorites-storage)).
+(see [Favorites storage](#favorites-storage)). `FAVORITES_MODE` overrides
+that heuristic explicitly: `server` forces server mode (even without a
+token — requests go unauthenticated and errors surface in the footer),
+`local` forces the local store (even with a token configured). An unknown
+value warns on stderr and falls back to token-based mode.
 
-Precedence: a non-empty environment variable of the same name wins over the
-file value, which wins over an unset value. A missing file is fine (empty
-config); invalid JSON prints a warning to stderr and is treated as empty
-config. Unknown JSON keys are ignored, and blank values count as unset.
-Values are never logged or printed.
+A missing file is fine (empty config); invalid JSON prints a warning to
+stderr and is treated as empty config. Unknown JSON keys are ignored, and
+blank values count as unset. Values are never logged or printed.
 
 All state lives under gifdeck-owned directories: config in
 `~/.config/gifdeck/`, favorites store in `~/.local/share/gifdeck/`, and

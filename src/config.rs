@@ -15,6 +15,8 @@ struct RawConfig {
     favorites_api: Option<String>,
     #[serde(rename = "GIFDECK_FAVORITES_TOKEN")]
     favorites_token: Option<String>,
+    #[serde(rename = "FAVORITES_MODE")]
+    favorites_mode: Option<String>,
 }
 
 /// Resolved runtime configuration.
@@ -24,15 +26,9 @@ pub struct Config {
     pub giphy_api_key: Option<String>,
     pub favorites_api: Option<String>,
     pub favorites_token: Option<String>,
+    /// Explicit favorites-mode override: `"server"` or `"local"`.
+    pub favorites_mode: Option<String>,
 }
-
-/// Canonical keys that can be overridden via environment variables.
-const ENV_KEYS: [&str; 4] = [
-    "KLIPY_API_KEY",
-    "GIPHY_API_KEY",
-    "GIFDECK_FAVORITES_API",
-    "GIFDECK_FAVORITES_TOKEN",
-];
 
 /// Default favorites API base when not configured.
 pub const DEFAULT_FAVORITES_API: &str = "https://favs.veryshiny.net/api/v1";
@@ -58,12 +54,12 @@ pub fn config() -> &'static Config {
     CONFIG.get_or_init(load)
 }
 
-/// Reads and resolves configuration.
+/// Reads and resolves configuration from the config file.
 ///
-/// Precedence: non-empty env var wins, then file value, then unset.
-/// A missing file is not an error. Invalid JSON warns to stderr and
-/// continues with an empty config. Empty values are treated as unset.
-/// Values are never logged in the clear.
+/// The file is the only source of configuration values. A missing file
+/// is not an error. Invalid JSON warns to stderr and continues with an
+/// empty config. Empty/blank values are treated as unset. Values are
+/// never logged in the clear.
 fn load() -> Config {
     let mut cfg = Config::default();
     let path = config_path();
@@ -75,6 +71,7 @@ fn load() -> Config {
                 cfg.giphy_api_key = non_empty(raw.giphy_api_key);
                 cfg.favorites_api = non_empty(raw.favorites_api);
                 cfg.favorites_token = non_empty(raw.favorites_token);
+                cfg.favorites_mode = favorites_mode(&raw.favorites_mode);
             }
             Err(e) => {
                 eprintln!(
@@ -96,27 +93,30 @@ fn load() -> Config {
         }
     }
 
-    // Env overrides win.
-    for key in ENV_KEYS {
-        if let Ok(val) = env::var(key) {
-            if !val.is_empty() {
-                match key {
-                    "KLIPY_API_KEY" => cfg.klipy_api_key = Some(val),
-                    "GIPHY_API_KEY" => cfg.giphy_api_key = Some(val),
-                    "GIFDECK_FAVORITES_API" => cfg.favorites_api = Some(val),
-                    "GIFDECK_FAVORITES_TOKEN" => cfg.favorites_token = Some(val),
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-
     cfg
 }
 
 /// `Some` only for non-blank values (empty file values are unset).
 fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
+}
+
+/// Validate and normalize the `FAVORITES_MODE` key. Returns `None` for
+/// blank values and warns on unknown values (treated as unset, so mode
+/// falls back to token presence).
+fn favorites_mode(raw: &Option<String>) -> Option<String> {
+    let value = raw.as_deref()?.trim().to_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    if value != "server" && value != "local" {
+        eprintln!(
+            "gifdeck: warning: unknown FAVORITES_MODE value; expected \"server\" or \"local\". \
+             Falling back to token-based mode."
+        );
+        return None;
+    }
+    Some(value)
 }
 
 impl Config {
@@ -127,11 +127,19 @@ impl Config {
             .unwrap_or(DEFAULT_FAVORITES_API)
     }
 
-    /// Whether favorites live on the self-hosted server. When no token is
-    /// configured, favorites use the local store instead — the two are
-    /// exclusive, never a fallback for one another.
+    /// Whether favorites live on the self-hosted server. An explicit
+    /// `FAVORITES_MODE` overrides the token heuristic: `"server"` forces
+    /// server mode (even without a token — requests just go unauthenticated
+    /// and server errors surface in the footer), `"local"` forces the local
+    /// store (even when a token is configured). Otherwise mode is decided
+    /// by token presence. The two stores are exclusive, never a fallback
+    /// for one another.
     pub fn use_server_favorites(&self) -> bool {
-        self.favorites_token.is_some()
+        match self.favorites_mode.as_deref() {
+            Some("local") => false,
+            Some("server") => true,
+            _ => self.favorites_token.is_some(),
+        }
     }
 }
 
@@ -139,7 +147,6 @@ impl Config {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, MutexGuard};
 
     fn temp_config(contents: &str) -> PathBuf {
         let dir = tempfile_dir();
@@ -154,26 +161,21 @@ mod tests {
         dir
     }
 
-    fn clear_env() {
-        for key in ENV_KEYS {
-            env::remove_var(key);
-        }
-        // Legacy gifgrep env vars must not leak into any test.
-        env::remove_var("GIFGREP_FAVORITES_API");
-        env::remove_var("GIFGREP_FAVORITES_TOKEN");
-        env::remove_var("GIFDECK_CONFIG");
+    /// Serializes `GIFDECK_CONFIG`-mutating tests to avoid cross-test races.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap()
     }
 
-    /// Serializes env-var-mutating tests to avoid cross-test races.
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap()
+    fn with_config(contents: &str) -> PathBuf {
+        let path = temp_config(contents);
+        env::set_var("GIFDECK_CONFIG", &path);
+        path
     }
 
     #[test]
     fn missing_file_is_empty_config() {
         let _guard = env_lock();
-        clear_env();
         env::set_var("GIFDECK_CONFIG", "/nonexistent/does-not-exist.json");
         let cfg = load();
         assert_eq!(cfg.klipy_api_key, None);
@@ -184,9 +186,7 @@ mod tests {
     #[test]
     fn invalid_json_warns_and_returns_empty() {
         let _guard = env_lock();
-        clear_env();
-        let path = temp_config("{ not valid json ");
-        env::set_var("GIFDECK_CONFIG", &path);
+        let _path = with_config("{ not valid json ");
         let cfg = load();
         assert_eq!(cfg.klipy_api_key, None);
     }
@@ -194,11 +194,9 @@ mod tests {
     #[test]
     fn reads_file_values() {
         let _guard = env_lock();
-        clear_env();
-        let path = temp_config(
+        let _path = with_config(
             r#"{"KLIPY_API_KEY":"filek","GIPHY_API_KEY":"fileg","GIFDECK_FAVORITES_API":"http://file/api","GIFDECK_FAVORITES_TOKEN":"filet"}"#,
         );
-        env::set_var("GIFDECK_CONFIG", &path);
         let cfg = load();
         assert_eq!(cfg.klipy_api_key.as_deref(), Some("filek"));
         assert_eq!(cfg.giphy_api_key.as_deref(), Some("fileg"));
@@ -208,67 +206,17 @@ mod tests {
     }
 
     #[test]
-    fn env_overrides_file() {
-        let _guard = env_lock();
-        clear_env();
-        let path = temp_config(
-            r#"{"KLIPY_API_KEY":"filek","GIFDECK_FAVORITES_API":"http://file/api"}"#,
-        );
-        env::set_var("GIFDECK_CONFIG", &path);
-        env::set_var("KLIPY_API_KEY", "envk");
-        env::set_var("GIFDECK_FAVORITES_API", "http://env/api");
-        let cfg = load();
-        assert_eq!(cfg.klipy_api_key.as_deref(), Some("envk"));
-        assert_eq!(cfg.favorites_api.as_deref(), Some("http://env/api"));
-        assert_eq!(cfg.giphy_api_key, None);
-    }
-
-    #[test]
-    fn legacy_gifgrep_keys_are_ignored() {
-        let _guard = env_lock();
-        clear_env();
-        // Old gifgrep names in the file must not resolve to anything.
-        let path = temp_config(
-            r#"{"GIFGREP_FAVORITES_API":"http://legacy/api","GIFGREP_FAVORITES_TOKEN":"legacyt"}"#,
-        );
-        env::set_var("GIFDECK_CONFIG", &path);
-        env::set_var("GIFGREP_FAVORITES_TOKEN", "envlegacy");
-        let cfg = load();
-        assert_eq!(cfg.favorites_api, None, "legacy API key must be ignored");
-        assert_eq!(cfg.favorites_token, None, "legacy token must be ignored");
-        assert!(!cfg.use_server_favorites());
-        assert_eq!(cfg.favorites_api(), DEFAULT_FAVORITES_API);
-    }
-
-    #[test]
     fn unknown_json_keys_ignored() {
         let _guard = env_lock();
-        clear_env();
-        let path = temp_config(r#"{"SOMETHING_ELSE":"x","KLIPY_API_KEY":"k","unknown":1}"#);
-        env::set_var("GIFDECK_CONFIG", &path);
+        let _path = with_config(r#"{"SOMETHING_ELSE":"x","KLIPY_API_KEY":"k","unknown":1}"#);
         let cfg = load();
         assert_eq!(cfg.klipy_api_key.as_deref(), Some("k"));
     }
 
     #[test]
-    fn empty_env_does_not_override() {
-        let _guard = env_lock();
-        clear_env();
-        let path = temp_config(r#"{"KLIPY_API_KEY":"filek"}"#);
-        env::set_var("GIFDECK_CONFIG", &path);
-        env::set_var("KLIPY_API_KEY", "");
-        let cfg = load();
-        assert_eq!(cfg.klipy_api_key.as_deref(), Some("filek"));
-    }
-
-    #[test]
     fn blank_file_values_are_unset() {
         let _guard = env_lock();
-        clear_env();
-        let path = temp_config(
-            r#"{"KLIPY_API_KEY":"  ","GIFDECK_FAVORITES_TOKEN":""}"#,
-        );
-        env::set_var("GIFDECK_CONFIG", &path);
+        let _path = with_config(r#"{"KLIPY_API_KEY":"  ","GIFDECK_FAVORITES_TOKEN":""}"#);
         let cfg = load();
         assert_eq!(cfg.klipy_api_key, None);
         assert_eq!(cfg.favorites_token, None, "blank token means local mode");
@@ -278,7 +226,6 @@ mod tests {
     #[test]
     fn gifdeck_config_env_overrides_default_path() {
         let _guard = env_lock();
-        clear_env();
         env::set_var("GIFDECK_CONFIG", "/some/alt/file.json");
         assert_eq!(config_path(), PathBuf::from("/some/alt/file.json"));
     }
@@ -286,7 +233,7 @@ mod tests {
     #[test]
     fn default_path_lives_in_gifdeck_dir() {
         let _guard = env_lock();
-        clear_env();
+        env::remove_var("GIFDECK_CONFIG");
         let path = config_path();
         let in_gifdeck = path
             .components()
@@ -296,5 +243,70 @@ mod tests {
             !path.to_string_lossy().contains("gifgrep"),
             "no gifgrep references: {path:?}"
         );
+    }
+
+    #[test]
+    fn favorites_mode_local_overrides_token() {
+        let _guard = env_lock();
+        let _path = with_config(
+            r#"{"GIFDECK_FAVORITES_TOKEN":"tok","FAVORITES_MODE":"local"}"#,
+        );
+        let cfg = load();
+        assert_eq!(cfg.favorites_mode.as_deref(), Some("local"));
+        assert!(
+            !cfg.use_server_favorites(),
+            "explicit local mode wins over a configured token"
+        );
+    }
+
+    #[test]
+    fn favorites_mode_server_overrides_missing_token() {
+        let _guard = env_lock();
+        let _path = with_config(r#"{"FAVORITES_MODE":"server"}"#);
+        let cfg = load();
+        assert_eq!(cfg.favorites_mode.as_deref(), Some("server"));
+        assert!(
+            cfg.use_server_favorites(),
+            "explicit server mode wins over a missing token"
+        );
+    }
+
+    #[test]
+    fn favorites_mode_is_case_insensitive_and_trimmed() {
+        let _guard = env_lock();
+        let _path = with_config(r#"{"FAVORITES_MODE":"  Local "}"#);
+        let cfg = load();
+        assert_eq!(cfg.favorites_mode.as_deref(), Some("local"));
+        assert!(!cfg.use_server_favorites());
+    }
+
+    #[test]
+    fn favorites_mode_invalid_falls_back_to_token_presence() {
+        let _guard = env_lock();
+        let _path = with_config(
+            r#"{"GIFDECK_FAVORITES_TOKEN":"tok","FAVORITES_MODE":"neither"}"#,
+        );
+        let cfg = load();
+        assert_eq!(cfg.favorites_mode, None, "invalid mode is unset");
+        assert!(cfg.use_server_favorites(), "falls back to token presence");
+    }
+
+    #[test]
+    fn favorites_mode_blank_is_unset() {
+        let _guard = env_lock();
+        let _path = with_config(r#"{"FAVORITES_MODE":"   "}"#);
+        let cfg = load();
+        assert_eq!(cfg.favorites_mode, None);
+        assert!(!cfg.use_server_favorites());
+    }
+
+    #[test]
+    fn favorites_mode_unknown_keys_ignored_test_placeholder() {
+        // Guards against accidentally treating legacy unknown keys as mode.
+        let _guard = env_lock();
+        let _path = with_config(r#"{"GIFGREP_FAVORITES_TOKEN":"legacyt"}"#);
+        let cfg = load();
+        assert_eq!(cfg.favorites_token, None, "legacy keys are not read");
+        assert_eq!(cfg.favorites_mode, None);
     }
 }

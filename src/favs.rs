@@ -256,9 +256,20 @@ pub enum FavsBackend {
 }
 
 impl FavsBackend {
-    /// Backend implied by the config: the server when a favorites token
-    /// is configured, otherwise the local store.
+    /// Backend implied by the config: an explicit `FAVORITES_MODE`
+    /// (`"server"` / `"local"`) wins, otherwise the server is chosen when
+    /// a favorites token is configured and the local store when not.
     pub fn from_config(cfg: &Config) -> Self {
+        match cfg.favorites_mode.as_deref() {
+            Some("local") => return FavsBackend::Local(LocalStore::new()),
+            Some("server") => {
+                if let Ok(client) = FavsClient::new(cfg) {
+                    return FavsBackend::Server(client);
+                }
+                return FavsBackend::Local(LocalStore::new());
+            }
+            _ => {}
+        }
         if cfg.use_server_favorites() {
             if let Ok(client) = FavsClient::new(cfg) {
                 return FavsBackend::Server(client);
@@ -354,6 +365,7 @@ mod tests {
             giphy_api_key: None,
             favorites_api: Some(base.to_string()),
             favorites_token: Some("sekret".to_string()),
+            favorites_mode: None,
         };
         FavsClient::new(&cfg).unwrap()
     }
@@ -547,6 +559,40 @@ mod tests {
 
         // Default config → local.
         assert!(FavsBackend::from_config(&Config::default()).is_local());
+    }
+
+    #[test]
+    fn backend_from_config_mode_overrides_token_heuristic() {
+        // Explicit local mode wins even with a token configured.
+        let cfg = Config {
+            favorites_api: Some("http://cfg-server/api".into()),
+            favorites_token: Some("tok".into()),
+            favorites_mode: Some("local".into()),
+            ..Config::default()
+        };
+        assert!(FavsBackend::from_config(&cfg).is_local());
+
+        // Explicit server mode wins without a token.
+        let cfg = Config {
+            favorites_api: Some("http://cfg-server/api".into()),
+            favorites_token: None,
+            favorites_mode: Some("server".into()),
+            ..Config::default()
+        };
+        assert!(matches!(
+            FavsBackend::from_config(&cfg),
+            FavsBackend::Server(_)
+        ));
+
+        // An unset mode keeps the token-presence default.
+        let cfg = Config {
+            favorites_token: Some("tok".into()),
+            ..Config::default()
+        };
+        assert!(matches!(
+            FavsBackend::from_config(&cfg),
+            FavsBackend::Server(_)
+        ));
     }
 
     #[tokio::test]
