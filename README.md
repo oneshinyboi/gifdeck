@@ -42,6 +42,18 @@ cargo test
 
 ## Quick start
 
+Searching needs an API key. Put at least one of `GIPHY_API_KEY` or
+`KLIPY_API_KEY` in `~/.config/gifdeck/config.json`:
+
+```json
+{ "GIPHY_API_KEY": "…" }
+```
+
+(All values come from this file — there is no environment-variable
+fallback. See [Configuration](#configuration).)
+
+Then run:
+
 ```
 gifdeck
 ```
@@ -49,6 +61,10 @@ gifdeck
 That's it — the picker opens with a focused search box. Type a query,
 press Enter, move around with the arrow keys (or `h j k l`), and press
 Enter on a GIF to choose it.
+
+Without a key the picker still opens — favorites work — but searches
+fail with `KLIPY_API_KEY is not configured` in the footer until you add
+one.
 
 ## Usage
 
@@ -187,15 +203,18 @@ gifdeck reads one JSON config file at startup:
 (Linux path; other platforms follow the OS convention. Point the
 `GIFDECK_CONFIG` environment variable at an alternate file to override.)
 
-Every key is optional:
+No key is mandatory to launch — a missing or empty config file is fine,
+and gifdeck runs with local favorites. But the keys are not equally
+optional: searching needs at least one provider API key, and
+server-mode favorites need the favorites API and token.
 
-| Key                       | Meaning                                          |
-| ------------------------- | ------------------------------------------------ |
-| `KLIPY_API_KEY`           | KLIPY search API key                             |
-| `GIPHY_API_KEY`           | GIPHY search API key                             |
-| `GIFDECK_FAVORITES_API`   | favorites server base URL, e.g. `https://your-host/api/v1` (required in server mode; no default) |
-| `GIFDECK_FAVORITES_TOKEN` | favorites server auth token                      |
-| `FAVORITES_MODE`          | force the favorites mode: `server` or `local`    |
+| Key                       | Required for                                     | Meaning                                          |
+| ------------------------- | ------------------------------------------------ | ------------------------------------------------ |
+| `KLIPY_API_KEY`           | searching (one of the two keys suffices)         | KLIPY search API key                             |
+| `GIPHY_API_KEY`           | searching (one of the two keys suffices)         | GIPHY search API key                             |
+| `GIFDECK_FAVORITES_API`   | server-mode favorites only                       | favorites server base URL, e.g. `https://your-host/api/v1` (no default) |
+| `GIFDECK_FAVORITES_TOKEN` | server-mode favorites                            | favorites server auth token                      |
+| `FAVORITES_MODE`          | forcing a favorites mode (otherwise optional)    | `server` or `local`                              |
 
 Example:
 
@@ -217,7 +236,9 @@ back to the token rule.
 
 A missing config file is fine — gifdeck runs with local favorites. An
 invalid one prints a warning and is treated as empty. Unknown keys are
-ignored, blank values count as unset, and values are never logged.
+ignored, blank values count as unset, and values are never logged. All
+configuration values are read from the file only; setting
+`KLIPY_API_KEY`-style environment variables has no effect.
 
 ## File locations
 
