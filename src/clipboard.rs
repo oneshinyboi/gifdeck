@@ -1,8 +1,7 @@
 //! Clipboard helpers: URLs as text and GIF files as `image/gif` bytes.
 //!
 //! Wayland uses `wl-copy` (serving the GIF from stdin); X11 falls back to
-//! `xclip` (reading the GIF from a file argument). Pasting into Concord
-//! with Ctrl+V then inserts a real animated `.gif` attachment.
+//! `xclip` (reading the GIF from a file argument).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -149,7 +148,7 @@ pub fn place_gif_on_clipboard(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Download the GIF at `url` and put its bytes on the clipboard as
-/// `image/gif`, so a paste inserts a real animated GIF attachment.
+/// `image/gif`.
 pub async fn copy_gif_file(http: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     let path = download_gif(http, url).await?;
     place_gif_on_clipboard(&path)

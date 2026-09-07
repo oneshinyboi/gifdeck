@@ -23,7 +23,8 @@ use crate::favs::{FavItem, FavsBackend};
 use crate::preview::{self, PreviewCache, PreviewLoader, MAX_CACHE_CAP, PREVIEW_SIZE};
 use crate::providers::{self, GifResult, Provider};
 
-/// A selectable GIF: what's shown vs. what gets pasted when selected.
+/// A selectable GIF: what's shown vs. what gets copied to the clipboard
+/// when selected.
 #[derive(Debug, Clone)]
 pub struct UrlItem {
     pub id: String,
@@ -769,7 +770,7 @@ impl App {
     }
 
     /// Download the selected GIF and put its bytes on the clipboard as
-    /// image/gif (paste inserts a real animated GIF attachment).
+    /// image/gif.
     async fn copy_gif(&mut self) {
         let Some(item) = self.active_item().cloned() else {
             return;
@@ -783,8 +784,7 @@ impl App {
         }
     }
 
-    /// Copy the selected GIF's URL as text (the "paste URL → animated
-    /// embed" path). Returns whether the copy succeeded.
+    /// Copy the selected GIF's URL as text. Returns whether the copy succeeded.
     fn copy_url(&mut self) -> bool {
         let Some(item) = self.active_item().cloned() else {
             return false;
