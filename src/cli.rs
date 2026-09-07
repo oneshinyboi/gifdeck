@@ -54,11 +54,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Open the interactive TUI GIF list.
+    /// Open the unified picker: a Search + Favorites tabbed GIF grid.
     Tui {
-        /// Optional search query; without one the list is empty.
+        /// Optional initial search query (pre-filled and run on open).
         query: Option<String>,
-        /// Start from the favorites list instead of search results.
+        /// Open on the Favorites tab instead of Search.
         #[arg(long)]
         favs: bool,
     },
