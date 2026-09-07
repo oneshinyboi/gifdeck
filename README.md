@@ -10,18 +10,20 @@ client via Ctrl+V paste.
 
 ## Status
 
-Session 1 (scaffold + plumbing). Implemented: CLI, config, GIPHY/KLIPY search
-providers, favorites client, and a minimal read-only ratatui list UI.
+Session 2 (grid TUI). Implemented: CLI, config, GIPHY/KLIPY search providers,
+favorites client, and an animated GIF grid TUI with inline previews on
+Kitty/Ghostty-style terminals (Kitty graphics protocol) and a title-only
+fallback elsewhere.
 
-Not yet implemented (later sessions): grid layout, animated previews, the
-unified Search/Favorites GUI, and the `c`/`v` favorite actions.
+Not yet implemented (session 3): the unified Search/Favorites tabs, the
+`c`/`v` favorite actions, and interactive search box.
 
 ## Usage
 
 ```
 gifdeck search <query> [--source auto|giphy|klipy] [--max N] [--json]
 gifdeck favs [--json]
-gifdeck tui [query] [--favs]
+gifdeck tui <query> [--favs]
 ```
 
 Examples:
@@ -36,14 +38,33 @@ gifdeck search cat --json
 # List favorites from the server
 gifdeck favs
 
-# Interactive list TUI (search results, or favorites with --favs)
+# Animated GIF grid of search results
 gifdeck tui cat
+
+# Animated GIF grid of your favorites
 gifdeck tui --favs
 ```
 
-In the TUI: `↑`/`k` and `↓`/`j` scroll, `Enter` selects (prints the URL and
-copies it to the clipboard when `wl-copy` or `xclip` is installed), `q`
-quits. The TUI requires a terminal; over a non-TTY it exits with an error.
+`gifdeck tui` with no query downloads nothing and prints a usage hint.
+
+## TUI
+
+The grid shows up to a bounded window (cache cap 32) of inline GIF previews
+fetched and decoded asynchronously; the cells nearest the cursor load first
+and older ones are evicted as you move. On terminals speaking the Kitty
+graphics protocol (kitty, ghostty) the previews are animated. Anywhere else
+the TUI falls back to a title-only grid with a footer note, so it never
+crashes in a plain terminal emulator.
+
+```
+← → ↑ ↓ / h j k l   move (wrapping), PgUp/PgDn page, ^U/^D half-page
+Enter / Space       select the GIF, printing its URL
+q / Ctrl+C / Esc    quit
+```
+
+On select the URL is printed and copied to the clipboard when `wl-copy` or
+`xclip` is installed. The TUI requires a terminal; over a non-TTY it exits
+with an error.
 
 ## Configuration
 
@@ -83,5 +104,6 @@ cargo test
 - `src/config.rs` — path resolution, load-once, precedence
 - `src/providers.rs` — `GifResult` + GIPHY/KLIPY clients
 - `src/favs.rs` — self-hosted favorites client (wiremock contract tests)
-- `src/app.rs` — TUI App state, event loop, draw (list only)
+- `src/app.rs` — TUI grid state, navigation, event loop, draw
+- `src/preview.rs` — bounded LRU preview cache, async loader, kitty encode/render
 - `src/cli.rs` — clap definitions
