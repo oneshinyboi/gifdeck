@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod favs;
+mod preview;
 mod providers;
 
 use std::io::IsTerminal;
@@ -88,20 +89,20 @@ async fn cmd_tui(query: Option<String>, favs_only: bool) -> anyhow::Result<()> {
                 app::UrlItem {
                     title,
                     url: f.url,
+                    preview_url: f.preview,
                 }
             })
             .collect::<Vec<_>>()
     } else if let Some(q) = query {
         let results = providers::search(&client, cfg, providers::Source::Auto, &q, 50).await?;
-        results
-            .into_iter()
-            .map(|r| app::UrlItem {
-                title: r.title,
-                url: r.url,
-            })
-            .collect::<Vec<_>>()
+        results.into_iter().map(app::UrlItem::from).collect::<Vec<_>>()
     } else {
-        Vec::new()
+        eprintln!(
+            "usage: gifdeck tui <query>         search a GIF grid\n\
+             usage: gifdeck tui --favs          browse your favorites\n\n\
+             Pass a search query or --favs to open the picker."
+        );
+        return Ok(());
     };
 
     let heading = if favs_only { "Favorites" } else { "Search" };
