@@ -10,22 +10,23 @@ client via Ctrl+V paste.
 
 ## Status
 
-Session 4 (unified picker). Implemented: CLI, config, GIPHY/KLIPY search
-providers, favorites client, and a single tabbed picker — an interactive
-Search box plus a Favorites tab sharing one animated GIF grid with inline
-previews on Kitty/Ghostty-style terminals (Kitty graphics protocol) and a
-title-only fallback elsewhere. `v` favorites/unfavorites against the server,
-`c` copies the GIF file itself to the clipboard as `image/gif` (real
-attachment on paste), `y` copies the URL.
+Session 5 (local favorites + gifdeck-owned config/state). Implemented:
+CLI, config, GIPHY/KLIPY search providers, and a single tabbed picker —
+an interactive Search box plus a Favorites tab sharing one animated GIF
+grid with inline previews on Kitty/Ghostty-style terminals (Kitty
+graphics protocol) and a title-only fallback elsewhere. `v`
+favorites/unfavorites against the configured backend, `c` copies the GIF
+file itself to the clipboard as `image/gif` (real attachment on paste),
+`y` copies the URL. Favorites live either on the self-hosted server or in
+a local JSON store — whichever is configured, exclusively.
 
-Not yet implemented (next session): local favorites cache and a
-server/local mode; public readiness.
+Not yet implemented (next session): public readiness.
 
 ## Usage
 
 ```
 gifdeck search <query> [--source auto|giphy|klipy] [--max N] [--json]
-gifdeck favs [--json]
+gifdeck favs [--json] [--export] [--import]
 gifdeck tui [<query>] [--favs]
 ```
 
@@ -38,8 +39,14 @@ gifdeck search cat --source klipy --max 2
 # Same, as JSON
 gifdeck search cat --json
 
-# List favorites from the server
+# List favorites (server when configured, otherwise the local store)
 gifdeck favs
+
+# Copy the server's favorites into the local store (server mode only)
+gifdeck favs --export
+
+# Push the local store's favorites onto the server (server mode only)
+gifdeck favs --import
 
 # Unified picker: type a query, Enter to search, Tab to switch tabs
 gifdeck tui
@@ -53,6 +60,30 @@ gifdeck tui --favs
 
 `gifdeck tui` with no query opens on the Search tab with an empty, focused
 search box — start typing.
+
+## Favorites storage
+
+Favorites have exactly one home, picked by the config — the two stores
+are alternatives, never a fallback for one another:
+
+- **Server mode** (default when `GIFDECK_FAVORITES_TOKEN` is configured):
+  favorites live on the self-hosted server
+  (`https://favs.veryshiny.net/api/v1` by default, `X-Auth-Token` auth).
+- **Local mode** (no token configured): favorites live in a plain JSON
+  file at `~/.local/share/gifdeck/favorites.json` — no server needed,
+  which is also gifdeck's out-of-the-box story.
+
+The picker shows which mode it's in (`v favorite · local favorites` in
+the footer) and `v` toggles against the active backend instantly. The
+only crossover between the two stores is explicit:
+
+- `gifdeck favs --export` — server → local store (overwrites the local
+  file with the server's list)
+- `gifdeck favs --import` — local store → server (upserts each entry by
+  id; idempotent)
+
+So switching modes is a two-step choice: transfer with `--export`/`--import`,
+then add or remove `GIFDECK_FAVORITES_TOKEN` from the config.
 
 ## TUI
 
@@ -86,7 +117,8 @@ Space               choose the selected GIF
 Tab                 switch between Search and Favorites
 c                   copy the GIF FILE to the clipboard as image/gif
 y                   copy the GIF URL as text
-v                   favorite / unfavorite the selected GIF on the server
+v                   favorite / unfavorite the selected GIF (against the
+                    configured backend — server or local store)
 q / Esc / Ctrl+C    quit (Esc clears/blurs the search box when focused)
 ```
 
@@ -115,10 +147,12 @@ keeps serving from its open descriptor). `y` copies just the URL text
 `xclip -selection clipboard` reading the URL from stdin.
 
 `v` toggles the favorite state of the selected GIF against the
-self-hosted server (POST `/favorites` to star, `DELETE /favorites/{id}`
-to unstar) and reports the outcome in the footer; server errors surface
-there too and never crash the picker. While on the Favorites tab the
-grid re-syncs with the server after each toggle.
+configured backend — on the server that's POST `/favorites` to star and
+DELETE `/favorites/{id}` to unstar; in local mode it's an instant
+upsert/remove in the JSON store. The outcome is reported in the footer
+("★ saved to favorites" / "★ saved to local favorites"), and backend
+errors surface there too and never crash the picker. While on the
+Favorites tab the grid re-syncs with the backend after each toggle.
 
 On select (Enter/Space) the URL is printed and copied to the clipboard
 when `wl-copy` or `xclip` is installed. The TUI requires a terminal;
@@ -126,28 +160,34 @@ over a non-TTY it exits with an error.
 
 ## Configuration
 
-Configuration is read once per process from the gifgrep config file:
+Configuration is read once per process from the gifdeck config file:
 
 ```
-<dirs::config_dir()>/gifgrep/config.json
+<dirs::config_dir()>/gifdeck/config.json
 ```
 
 Override the path with the `GIFDECK_CONFIG` environment variable pointing at
-an alternate file.
-
-Keys (same names as gifgrep, so existing keys and tokens carry over):
+an alternate file. Keys and env vars:
 
 | Key                      | Meaning                          |
 | ------------------------ | -------------------------------- |
 | `KLIPY_API_KEY`          | KLIPY search API key             |
 | `GIPHY_API_KEY`          | GIPHY search API key             |
-| `GIFGREP_FAVORITES_API`  | favorites server base URL        |
-| `GIFGREP_FAVORITES_TOKEN`| favorites server auth token      |
+| `GIFDECK_FAVORITES_API`  | favorites server base URL        |
+| `GIFDECK_FAVORITES_TOKEN`| favorites server auth token      |
+
+The token decides the favorites mode: set → server, unset → local store
+(see [Favorites storage](#favorites-storage)).
 
 Precedence: a non-empty environment variable of the same name wins over the
 file value, which wins over an unset value. A missing file is fine (empty
 config); invalid JSON prints a warning to stderr and is treated as empty
-config. Unknown JSON keys are ignored. Values are never logged or printed.
+config. Unknown JSON keys are ignored, and blank values count as unset.
+Values are never logged or printed.
+
+All state lives under gifdeck-owned directories: config in
+`~/.config/gifdeck/`, favorites store in `~/.local/share/gifdeck/`, and
+temp GIF downloads for clipboard copies in `~/.cache/gifdeck/`.
 
 ## Building
 
@@ -159,9 +199,10 @@ cargo test
 ## Layout
 
 - `src/main.rs` — clap dispatch, unified-picker session setup
-- `src/config.rs` — path resolution, load-once, precedence
+- `src/config.rs` — path resolution, load-once, precedence, favorites mode
 - `src/providers.rs` — `GifResult` + GIPHY/KLIPY clients
-- `src/favs.rs` — self-hosted favorites client (wiremock contract tests)
+- `src/favs.rs` — favorites backend (server client / local store), wiremock contract tests
+- `src/store.rs` — local favorites store (atomic JSON, `~/.local/share/gifdeck/`)
 - `src/app.rs` — tabbed picker state, search box, keymap, event loop, draw
 - `src/clipboard.rs` — GIF-file/URL clipboard (wl-copy, xclip)
 - `src/preview.rs` — bounded LRU preview cache, async loader, kitty encode/render
