@@ -12,6 +12,9 @@ Source0:        %{url}/archive/refs/tags/v%{version}/gifdeck-%{version}.tar.gz
 
 BuildRequires:  rust
 BuildRequires:  cargo
+BuildRequires:  cmake
+BuildRequires:  gcc
+BuildRequires:  gcc-c++
 
 %global _description %{expand:
 A GIF picker for the terminal. Search GIPHY and KLIPY, browse results in
