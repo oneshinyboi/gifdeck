@@ -57,10 +57,22 @@ the TUI falls back to a title-only grid with a footer note, so it never
 crashes in a plain terminal emulator.
 
 ```
-← → ↑ ↓ / h j k l   move (wrapping), PgUp/PgDn page, ^U/^D half-page
+← → ↑ ↓ / h j k l   move (wrapping), PgUp/PgDn scroll within the page
+d                    discard the page and fetch the next 50 results
+u                    go back to the previous page (no-op on the first)
 Enter / Space       select the GIF, printing its URL
 q / Ctrl+C / Esc    quit
 ```
+
+Paging hits the source API again (GIPHY offset / KLIPY cursor) or the
+favorites server (`?limit=50&offset=…`), replaces the whole grid, and
+resets the cursor to the top-left. The footer shows `page N/M` when the
+source reports a total (GIPHY result count; favorites server
+`X-Total-Count` header) and `page N` otherwise (KLIPY exposes no total).
+At the end of the results the current page is kept and the footer notes
+there are no more. Ctrl+D/Ctrl+U still work as aliases for d/u. On
+terminals without a pager (not used in practice) u/d fall back to
+half-page scrolling.
 
 On select the URL is printed and copied to the clipboard when `wl-copy` or
 `xclip` is installed. The TUI requires a terminal; over a non-TTY it exits

@@ -192,9 +192,8 @@ mod tests {
     fn env_overrides_file() {
         let _guard = env_lock();
         clear_env();
-        let path = temp_config(
-            r#"{"KLIPY_API_KEY":"filek","GIFGREP_FAVORITES_API":"http://file/api"}"#,
-        );
+        let path =
+            temp_config(r#"{"KLIPY_API_KEY":"filek","GIFGREP_FAVORITES_API":"http://file/api"}"#);
         env::set_var("GIFDECK_CONFIG", &path);
         env::set_var("KLIPY_API_KEY", "envk");
         env::set_var("GIFGREP_FAVORITES_API", "http://env/api");
@@ -208,9 +207,7 @@ mod tests {
     fn unknown_json_keys_ignored() {
         let _guard = env_lock();
         clear_env();
-        let path = temp_config(
-            r#"{"SOMETHING_ELSE":"x","KLIPY_API_KEY":"k","unknown":1}"#,
-        );
+        let path = temp_config(r#"{"SOMETHING_ELSE":"x","KLIPY_API_KEY":"k","unknown":1}"#);
         env::set_var("GIFDECK_CONFIG", &path);
         let cfg = load();
         assert_eq!(cfg.klipy_api_key.as_deref(), Some("k"));

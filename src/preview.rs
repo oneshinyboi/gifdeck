@@ -115,15 +115,15 @@ impl PreviewCache {
 
     pub fn insert_ready(&mut self, url: &str, cached: CachedPreview) {
         self.loading.remove(url);
-        self.map.insert(url.to_string(), PreviewEntry::Ready(cached));
+        self.map
+            .insert(url.to_string(), PreviewEntry::Ready(cached));
         self.touch(url);
         self.evict();
     }
 
     pub fn insert_failed(&mut self, url: &str, why: String) {
         self.loading.remove(url);
-        self.map
-            .insert(url.to_string(), PreviewEntry::Failed(why));
+        self.map.insert(url.to_string(), PreviewEntry::Failed(why));
         self.touch(url);
         self.evict();
     }
@@ -133,6 +133,14 @@ impl PreviewCache {
     pub fn set_cap(&mut self, cap: usize) {
         self.cap = cap.clamp(1, MAX_CACHE_CAP);
         self.evict();
+    }
+
+    /// Drop all entries and in-flight request bookkeeping (used when the
+    /// whole item list is replaced, e.g. on a page change).
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.lru.clear();
+        self.loading.clear();
     }
 
     pub fn get(&self, url: &str) -> Option<&PreviewEntry> {
@@ -150,11 +158,7 @@ pub struct PreviewLoader {
 }
 
 impl PreviewLoader {
-    pub fn new(
-        client: reqwest::Client,
-        cache: Arc<Mutex<PreviewCache>>,
-        picker: Picker,
-    ) -> Self {
+    pub fn new(client: reqwest::Client, cache: Arc<Mutex<PreviewCache>>, picker: Picker) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             while let Some(url) = rx.recv().await {
@@ -232,9 +236,7 @@ pub fn decode_preview(bytes: &[u8], picker: &Picker) -> Result<Option<CachedPrev
         let dyn_img: DynamicImage = frame.buffer().clone().into();
         let protocol = picker.new_protocol(dyn_img, PREVIEW_SIZE, Resize::Fit(None))?;
         let (numer, denom) = frame.delay().numer_denom_ms();
-        let delay = Duration::from_millis(
-            (numer as u64).saturating_div(denom.max(1) as u64),
-        );
+        let delay = Duration::from_millis((numer as u64).saturating_div(denom.max(1) as u64));
         frames.push(protocol);
         delays.push(delay.max(MIN_FRAME_DELAY));
     }
@@ -301,10 +303,7 @@ mod tests {
 
     #[test]
     fn frame_index_wraps_and_selects() {
-        let delays = [
-            Duration::from_millis(100),
-            Duration::from_millis(100),
-        ];
+        let delays = [Duration::from_millis(100), Duration::from_millis(100)];
         assert_eq!(frame_index(&delays, Duration::from_millis(0)), 0);
         assert_eq!(frame_index(&delays, Duration::from_millis(99)), 0);
         assert_eq!(frame_index(&delays, Duration::from_millis(100)), 1);
@@ -345,12 +344,17 @@ mod tests {
         c.try_request("b");
         let picker = Picker::halfblocks();
         let img: DynamicImage = ImageBuffer::from_pixel(10, 10, Rgba([255u8, 0, 0, 255])).into();
-        let proto = picker.new_protocol(img, PREVIEW_SIZE, Resize::Fit(None)).unwrap();
-        c.insert_ready("a", CachedPreview {
-            frames: vec![proto],
-            delays: vec![Duration::from_millis(100)],
-            loaded_at: Instant::now(),
-        });
+        let proto = picker
+            .new_protocol(img, PREVIEW_SIZE, Resize::Fit(None))
+            .unwrap();
+        c.insert_ready(
+            "a",
+            CachedPreview {
+                frames: vec![proto],
+                delays: vec![Duration::from_millis(100)],
+                loaded_at: Instant::now(),
+            },
+        );
         assert!(c.try_request("c"));
         assert_eq!(c.len(), 2);
         assert!(c.get("b").is_none(), "least-recently-used 'b' evicted");
@@ -406,11 +410,14 @@ mod tests {
         assert!(!c.try_request("a"));
         c.insert_failed("a", "boom".to_string());
         assert!(!c.try_request("a"), "failed entries are not refetched");
-        c.insert_ready("b", CachedPreview {
-            frames: Vec::new(),
-            delays: Vec::new(),
-            loaded_at: Instant::now(),
-        });
+        c.insert_ready(
+            "b",
+            CachedPreview {
+                frames: Vec::new(),
+                delays: Vec::new(),
+                loaded_at: Instant::now(),
+            },
+        );
         assert!(!c.try_request("b"), "ready entries are not refetched");
     }
 
@@ -428,13 +435,17 @@ mod tests {
         let mut gif_bytes = Vec::new();
         {
             let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif_bytes);
-            encoder.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
+            encoder
+                .set_repeat(image::codecs::gif::Repeat::Infinite)
+                .unwrap();
             let f1: image::RgbaImage = ImageBuffer::from_pixel(20, 10, Rgba([10, 10, 10, 255]));
             let f2: image::RgbaImage = ImageBuffer::from_pixel(20, 10, Rgba([200, 200, 200, 255]));
             encoder.encode_frame(image::Frame::new(f1)).unwrap();
             encoder.encode_frame(image::Frame::new(f2)).unwrap();
         }
-        let cached = decode_preview(&gif_bytes, &picker).unwrap().expect("should decode");
+        let cached = decode_preview(&gif_bytes, &picker)
+            .unwrap()
+            .expect("should decode");
         assert_eq!(cached.frame_count(), 2);
     }
 }

@@ -15,6 +15,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use ratatui_image::picker::{Picker, ProtocolType};
 
+use crate::config::Config;
+use crate::favs::FavsClient;
 use crate::preview::{self, PreviewCache, PreviewLoader, MAX_CACHE_CAP, PREVIEW_SIZE};
 use crate::providers;
 
@@ -41,6 +43,200 @@ impl From<providers::GifResult> for UrlItem {
 pub const MIN_CELL_W: u16 = PREVIEW_SIZE.width + 2;
 /// Extra rows per cell besides the image: 2 borders + 1 title line.
 const CELL_EXTRA_H: u16 = 3;
+/// Items per page when paging against a server (u / d).
+pub const PAGE_SIZE: usize = 50;
+
+/// Direction of a page turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageDir {
+    Next,
+    Prev,
+}
+
+/// Outcome of a page-turn attempt.
+#[derive(Debug)]
+pub enum PageTurn {
+    /// The neighbor page was fetched; the grid should be replaced by these.
+    Page(Vec<UrlItem>),
+    /// Already on the first page (u).
+    AtFirst,
+    /// No further results exist (d).
+    AtLast,
+}
+
+/// Server-backed paging: u/d replace the whole grid with the
+/// previous/next page of results instead of scrolling within a page.
+#[derive(Debug, Clone)]
+pub enum Pager {
+    Search {
+        client: reqwest::Client,
+        cfg: Config,
+        source: providers::Source,
+        query: String,
+        /// Cursor used to fetch each visited page; `back[0]` is always
+        /// `Start`. `back.len() == current page + 1`.
+        back: Vec<providers::PageCursor>,
+        /// Cursor for the page after the current one (`None` = exhausted).
+        next: Option<providers::PageCursor>,
+        /// Total matching items, when the provider reports it (GIPHY).
+        total: Option<usize>,
+    },
+    Favs {
+        client: FavsClient,
+        /// Total favorites, from the server's `X-Total-Count`.
+        total: Option<usize>,
+    },
+}
+
+/// Pages covered by `total` items at `PAGE_SIZE` per page.
+fn total_pages(total: usize) -> usize {
+    total.div_ceil(PAGE_SIZE)
+}
+
+/// Footer fragment for the current page, e.g. `page 2/7` (or `page 2`
+/// when the total is unknown).
+fn page_label(page: usize, total: Option<usize>) -> String {
+    let pages = total.map(total_pages);
+    match pages {
+        Some(p) if p > 0 => format!("page {}/{}", page + 1, p),
+        _ => format!("page {}", page + 1),
+    }
+}
+
+impl Pager {
+    /// Pager for search results. `next`/`total` come from the initial
+    /// fetch (page 0).
+    pub fn search(
+        client: reqwest::Client,
+        cfg: Config,
+        source: providers::Source,
+        query: String,
+        next: Option<providers::PageCursor>,
+        total: Option<usize>,
+    ) -> Self {
+        Pager::Search {
+            client,
+            cfg,
+            source,
+            query,
+            back: vec![providers::PageCursor::Start],
+            next,
+            total,
+        }
+    }
+
+    /// Pager for the self-hosted favorites server (offset-based). `total`
+    /// comes from the initial fetch's `X-Total-Count` header.
+    pub fn favs(client: FavsClient, total: Option<usize>) -> Self {
+        Pager::Favs { client, total }
+    }
+
+    /// Total items across all pages, when the source reports it.
+    pub fn total(&self) -> Option<usize> {
+        match self {
+            Pager::Search { total, .. } | Pager::Favs { total, .. } => *total,
+        }
+    }
+
+    /// Fetch the neighbor page in direction `dir`, given the current
+    /// 0-based page number. Internal cursor state is only committed when
+    /// the fetch succeeds.
+    pub async fn turn(&mut self, dir: PageDir, page: usize) -> Result<PageTurn> {
+        match self {
+            Pager::Search {
+                client,
+                cfg,
+                source,
+                query,
+                back,
+                next,
+                total,
+            } => {
+                let cursor = match dir {
+                    PageDir::Next => {
+                        // With a known total, refuse turns past the last
+                        // page without hitting the API.
+                        if let Some(t) = *total {
+                            if page + 1 >= total_pages(t) {
+                                return Ok(PageTurn::AtLast);
+                            }
+                        }
+                        match next.clone() {
+                            Some(c) => c,
+                            None => return Ok(PageTurn::AtLast),
+                        }
+                    }
+                    PageDir::Prev => {
+                        if back.len() < 2 {
+                            return Ok(PageTurn::AtFirst);
+                        }
+                        back.pop();
+                        back.last()
+                            .cloned()
+                            .expect("back is non-empty after pop guard")
+                    }
+                };
+                let fetched =
+                    providers::search_page(client, cfg, *source, query, PAGE_SIZE, &cursor).await?;
+                if fetched.results.is_empty() {
+                    // Restore the cursor we popped so d still works after.
+                    if matches!(dir, PageDir::Prev) {
+                        back.push(cursor);
+                    }
+                    return Ok(PageTurn::AtLast);
+                }
+                let next_cursor = fetched.next;
+                let fetched_total = fetched.total;
+                let items: Vec<UrlItem> = fetched.results.into_iter().map(UrlItem::from).collect();
+                match dir {
+                    PageDir::Next => {
+                        back.push(cursor);
+                        *next = next_cursor;
+                    }
+                    PageDir::Prev => *next = next_cursor,
+                }
+                *total = fetched_total.or(*total);
+                Ok(PageTurn::Page(items))
+            }
+            Pager::Favs { client, total } => {
+                let target = match dir {
+                    PageDir::Next => {
+                        if let Some(t) = *total {
+                            if page + 1 >= total_pages(t) {
+                                return Ok(PageTurn::AtLast);
+                            }
+                        }
+                        page + 1
+                    }
+                    PageDir::Prev => {
+                        if page == 0 {
+                            return Ok(PageTurn::AtFirst);
+                        }
+                        page - 1
+                    }
+                };
+                let fetched = client.list_page(PAGE_SIZE, target * PAGE_SIZE).await?;
+                *total = fetched.total.or(*total);
+                if fetched.items.is_empty() {
+                    return Ok(PageTurn::AtLast);
+                }
+                let items = fetched
+                    .items
+                    .into_iter()
+                    .map(|f| {
+                        let title = if f.title.is_empty() { f.id } else { f.title };
+                        UrlItem {
+                            title,
+                            url: f.url,
+                            preview_url: f.preview,
+                        }
+                    })
+                    .collect();
+                Ok(PageTurn::Page(items))
+            }
+        }
+    }
+}
 
 fn cell_height() -> u16 {
     PREVIEW_SIZE.height + CELL_EXTRA_H
@@ -150,6 +346,13 @@ pub struct App {
     should_quit: bool,
     selected_url: Option<String>,
     mode: PreviewMode,
+    pager: Option<Pager>,
+    /// 0-based index of the currently displayed page.
+    page: usize,
+    /// Transient footer message (page-turn feedback, load errors).
+    status: Option<String>,
+    /// Page turn requested via u/d, executed by the event loop.
+    pending: Option<PageDir>,
 }
 
 impl App {
@@ -164,14 +367,14 @@ impl App {
             should_quit: false,
             selected_url: None,
             mode: PreviewMode::Fallback,
+            pager: None,
+            page: 0,
+            status: None,
+            pending: None,
         }
     }
 
-    pub fn enable_previews(
-        &mut self,
-        cache: Arc<Mutex<PreviewCache>>,
-        loader: PreviewLoader,
-    ) {
+    pub fn enable_previews(&mut self, cache: Arc<Mutex<PreviewCache>>, loader: PreviewLoader) {
         self.mode = PreviewMode::Graphics { cache, loader };
     }
 
@@ -216,9 +419,7 @@ impl App {
         if len == 0 {
             return;
         }
-        let jump = rows
-            .max(1)
-            .saturating_mul(self.cols.max(1) as usize);
+        let jump = rows.max(1).saturating_mul(self.cols.max(1) as usize);
         self.selected = if self.selected + jump >= len {
             len - 1
         } else {
@@ -232,9 +433,7 @@ impl App {
         if len == 0 {
             return;
         }
-        let jump = rows
-            .max(1)
-            .saturating_mul(self.cols.max(1) as usize);
+        let jump = rows.max(1).saturating_mul(self.cols.max(1) as usize);
         self.selected = if self.selected < jump {
             0
         } else {
@@ -259,6 +458,44 @@ impl App {
         self.scroll_up(((self.rows.max(1) / 2) as usize).max(1));
     }
 
+    /// Consume the page-turn request queued by u/d.
+    fn take_pending_page(&mut self) -> Option<PageDir> {
+        self.pending.take()
+    }
+
+    /// Swap the entire grid for a new page of items: reset the cursor to
+    /// the top-left and drop cached previews of the replaced page.
+    fn apply_page(&mut self, items: Vec<UrlItem>) {
+        self.items = items;
+        self.selected = 0;
+        self.first_item = 0;
+        self.status = None;
+        if let PreviewMode::Graphics { cache, .. } = &self.mode {
+            cache.lock().unwrap().clear();
+        }
+    }
+
+    /// Fetch and apply the neighbor page in direction `dir`, or surface
+    /// why the turn was refused. The current page is kept on failure.
+    async fn load_page(&mut self, dir: PageDir) {
+        let Some(pager) = &mut self.pager else {
+            return;
+        };
+        self.status = Some("loading…".into());
+        match pager.turn(dir, self.page).await {
+            Ok(PageTurn::Page(items)) => {
+                self.page = match dir {
+                    PageDir::Next => self.page + 1,
+                    PageDir::Prev => self.page.saturating_sub(1),
+                };
+                self.apply_page(items);
+            }
+            Ok(PageTurn::AtFirst) => self.status = Some("already on the first page".into()),
+            Ok(PageTurn::AtLast) => self.status = Some("no more results".into()),
+            Err(e) => self.status = Some(format!("page load failed: {e}")),
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         let len = self.items.len();
         match key.code {
@@ -279,11 +516,21 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.step(|i| nav_right(i, len)),
             KeyCode::PageDown => self.page_down(),
             KeyCode::PageUp => self.page_up(),
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.half_page_down()
+            // Plain d/u page the grid; Ctrl+D/Ctrl+U still work as aliases
+            // (the code is Char('d')/'u' either way).
+            KeyCode::Char('d') => {
+                if self.pager.is_some() {
+                    self.pending = Some(PageDir::Next);
+                } else {
+                    self.half_page_down()
+                }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.half_page_up()
+            KeyCode::Char('u') => {
+                if self.pager.is_some() {
+                    self.pending = Some(PageDir::Prev);
+                } else {
+                    self.half_page_up()
+                }
             }
             KeyCode::Home => {
                 self.selected = 0;
@@ -307,13 +554,7 @@ impl App {
         };
         let cols = (self.cols as usize).max(1);
         let rows = (self.rows as usize).max(1);
-        for idx in nearest_slots(
-            self.first_item,
-            cols,
-            rows,
-            self.items.len(),
-            self.selected,
-        ) {
+        for idx in nearest_slots(self.first_item, cols, rows, self.items.len(), self.selected) {
             let url = &self.items[idx].preview_url;
             if !url.is_empty() {
                 preview::ensure_requested(cache, loader, url);
@@ -342,10 +583,7 @@ impl App {
             cache.lock().unwrap().set_cap(visible);
         }
 
-        frame.render_widget(
-            Paragraph::new(format!(" {} ", self.heading)),
-            header_area,
-        );
+        frame.render_widget(Paragraph::new(format!(" {} ", self.heading)), header_area);
 
         if self.items.is_empty() {
             let msg = format!("{} — no items\npress q to quit", self.heading);
@@ -365,11 +603,14 @@ impl App {
                 let (loaded, requested, failed) = preview::preview_stats(cache);
                 ("", Some(loaded), Some(requested), Some(failed))
             }
-            PreviewMode::Fallback => (" · no graphics protocol — title-only mode", None, None, None),
+            PreviewMode::Fallback => (
+                " · no graphics protocol — title-only mode",
+                None,
+                None,
+                None,
+            ),
         };
-        let loaded_note = loaded
-            .map(|l| format!(" · {l} loaded"))
-            .unwrap_or_default();
+        let loaded_note = loaded.map(|l| format!(" · {l} loaded")).unwrap_or_default();
         let requested_note = requested
             .filter(|r| *r > 0)
             .map(|r| format!(" · {r} loading"))
@@ -378,8 +619,18 @@ impl App {
             .filter(|f| *f > 0)
             .map(|f| format!(" · {f} failed"))
             .unwrap_or_default();
+        let page_note = self
+            .pager
+            .as_ref()
+            .map(|pager| format!(" · {}", page_label(self.page, pager.total())))
+            .unwrap_or_default();
+        let status_note = self
+            .status
+            .as_deref()
+            .map(|s| format!(" · {s}"))
+            .unwrap_or_default();
         let footer = format!(
-            "{} items · ←↑↓→ / hjkl move · PgUp PgDn / ^U ^D page · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}",
+            "{} items{page_note} · ←↑↓→ / hjkl move · PgUp/PgDn scroll · d next page / u previous page · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}{status_note}",
             self.items.len()
         );
         frame.render_widget(Paragraph::new(footer), footer_area);
@@ -474,7 +725,14 @@ fn truncate(s: &str, width: u16) -> String {
 }
 
 /// Run the interactive GIF-grid TUI. Returns the selected GIF URL, if any.
-pub fn run(items: Vec<UrlItem>, heading: &str) -> Result<Option<String>> {
+///
+/// `pager` enables u/d whole-grid paging against the search provider or
+/// the favorites server; without it u/d fall back to half-page scrolling.
+pub async fn run(
+    items: Vec<UrlItem>,
+    heading: &str,
+    pager: Option<Pager>,
+) -> Result<Option<String>> {
     if !io::stdout().is_terminal() {
         anyhow::bail!("stdout is not a terminal; the TUI requires an interactive session");
     }
@@ -486,6 +744,7 @@ pub fn run(items: Vec<UrlItem>, heading: &str) -> Result<Option<String>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(items, heading);
+    app.pager = pager;
 
     if io::stdin().is_terminal() {
         match Picker::from_query_stdio() {
@@ -502,9 +761,14 @@ pub fn run(items: Vec<UrlItem>, heading: &str) -> Result<Option<String>> {
         }
     }
 
-    let result = (|| -> Result<Option<String>> {
+    let result: Result<Option<String>> = async {
         let tick = Duration::from_millis(50);
         while !app.should_quit {
+            if let Some(dir) = app.take_pending_page() {
+                app.status = Some("loading…".into());
+                terminal.draw(|f| app.draw(f))?;
+                app.load_page(dir).await;
+            }
             terminal.draw(|f| app.draw(f))?;
             if event::poll(tick)? {
                 if let Event::Key(key) = event::read()? {
@@ -513,7 +777,8 @@ pub fn run(items: Vec<UrlItem>, heading: &str) -> Result<Option<String>> {
             }
         }
         Ok(app.selected_url)
-    })();
+    }
+    .await;
 
     disable_raw_mode()?;
     stdout.execute(LeaveAlternateScreen)?;
@@ -699,51 +964,181 @@ mod tests {
         app.selected = 2;
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(app.should_quit);
-        assert_eq!(app.selected_url.as_deref(), Some("https://gifdeck.test/2.gif"));
+        assert_eq!(
+            app.selected_url.as_deref(),
+            Some("https://gifdeck.test/2.gif")
+        );
     }
 
     #[test]
-    fn ctrl_d_and_ctrl_u_half_page() {
+    fn d_and_u_half_page_without_pager() {
         let mut down = App::new(items(40), "t");
         down.cols = 4;
         down.rows = 6;
         down.selected = 0;
         // 6 rows -> half-page is 3 rows -> 12 cells.
-        down.handle_key(KeyEvent::new(
-            KeyCode::Char('d'),
-            KeyModifiers::CONTROL,
-        ));
+        down.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert_eq!(down.selected, 12);
 
         let mut up = App::new(items(40), "t");
         up.cols = 4;
         up.rows = 6;
         up.selected = 30;
-        up.handle_key(KeyEvent::new(
-            KeyCode::Char('u'),
-            KeyModifiers::CONTROL,
-        ));
+        up.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
         assert_eq!(up.selected, 18);
 
-        // Plain d/u must not page (reserved for future bindings).
-        let mut plain = App::new(items(40), "t");
-        plain.cols = 4;
-        plain.rows = 6;
-        plain.selected = 0;
-        plain.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
-        assert_eq!(plain.selected, 0, "plain 'd' does nothing");
+        // Ctrl+D/Ctrl+U still work as aliases for the same actions.
+        let mut ctrl = App::new(items(40), "t");
+        ctrl.cols = 4;
+        ctrl.rows = 6;
+        ctrl.selected = 0;
+        ctrl.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(ctrl.selected, 12);
     }
 
     #[test]
-    fn ctrl_d_clamps_at_end() {
+    fn d_clamps_at_end() {
         let mut app = App::new(items(40), "t");
         app.cols = 4;
         app.rows = 6;
         app.selected = 38;
-        app.handle_key(KeyEvent::new(
-            KeyCode::Char('d'),
-            KeyModifiers::CONTROL,
-        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert_eq!(app.selected, 39, "half-page clamps to last item");
+    }
+
+    fn search_pager(next: Option<providers::PageCursor>, total: Option<usize>) -> Pager {
+        Pager::search(
+            reqwest::Client::new(),
+            Config::default(),
+            providers::Source::Auto,
+            "cats".to_string(),
+            next,
+            total,
+        )
+    }
+
+    #[test]
+    fn d_with_pager_queues_next_page() {
+        let mut app = App::new(items(40), "t");
+        app.pager = Some(search_pager(
+            Some(providers::PageCursor::Giphy { offset: 40 }),
+            None,
+        ));
+        app.cols = 4;
+        app.rows = 6;
+        app.selected = 7;
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.pending, Some(PageDir::Next));
+        assert_eq!(app.selected, 7, "cursor does not move when paging");
+
+        // Ctrl+D remains an alias.
+        app.pending = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.pending, Some(PageDir::Next));
+    }
+
+    #[test]
+    fn u_with_pager_queues_prev_page() {
+        let mut app = App::new(items(40), "t");
+        app.pager = Some(search_pager(
+            Some(providers::PageCursor::Giphy { offset: 40 }),
+            None,
+        ));
+        app.page = 1;
+        app.selected = 7;
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(app.pending, Some(PageDir::Prev));
+        assert_eq!(app.selected, 7, "cursor does not move when paging");
+
+        // Ctrl+U remains an alias.
+        app.pending = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.pending, Some(PageDir::Prev));
+    }
+
+    #[test]
+    fn apply_page_replaces_items_and_resets_cursor() {
+        let mut app = App::new(items(40), "t");
+        app.cols = 4;
+        app.rows = 6;
+        app.selected = 17;
+        app.first_item = 16;
+        app.page = 2;
+        app.apply_page(items(3));
+        assert_eq!(app.items.len(), 3);
+        assert_eq!(app.items[0].url, "https://gifdeck.test/0.gif");
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.first_item, 0);
+        assert_eq!(app.status, None);
+    }
+
+    #[tokio::test]
+    async fn pager_next_without_cursor_reports_last_page() {
+        let mut pager = search_pager(None, None);
+        assert!(matches!(
+            pager.turn(PageDir::Next, 0).await,
+            Ok(PageTurn::AtLast)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pager_prev_at_first_page_is_refused() {
+        let mut pager = search_pager(
+            Some(providers::PageCursor::Klipy {
+                pos: "abc".to_string(),
+            }),
+            None,
+        );
+        assert!(matches!(
+            pager.turn(PageDir::Prev, 0).await,
+            Ok(PageTurn::AtFirst)
+        ));
+
+        let mut pager = Pager::favs(FavsClient::new(&Config::default()).unwrap(), None);
+        assert!(matches!(
+            pager.turn(PageDir::Prev, 0).await,
+            Ok(PageTurn::AtFirst)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pager_next_past_known_total_is_refused_offline() {
+        // 100 items = 2 pages; on page 1 (0-based) a Next turn must not
+        // hit the network at all — the mock-free client proves it.
+        let mut pager = search_pager(Some(providers::PageCursor::Giphy { offset: 50 }), Some(100));
+        assert!(matches!(
+            pager.turn(PageDir::Next, 1).await,
+            Ok(PageTurn::AtLast)
+        ));
+
+        // 101 items = 3 pages; page 1 still has a successor.
+        let mut pager = search_pager(Some(providers::PageCursor::Giphy { offset: 50 }), Some(101));
+        // Would fetch: no total-based refusal, so turn() proceeds to the
+        // (missing) key check only via next cursor. With a cursor present
+        // it tries the network and fails on the invalid key — proving the
+        // shortcut did not trigger. Accept either a network error or a
+        // page; the point is it was not refused locally.
+        let result = pager.turn(PageDir::Next, 1).await;
+        assert!(
+            !matches!(result, Ok(PageTurn::AtLast)),
+            "page 2 of 3 must not be refused locally"
+        );
+
+        let mut pager = Pager::favs(FavsClient::new(&Config::default()).unwrap(), Some(100));
+        assert!(matches!(
+            pager.turn(PageDir::Next, 1).await,
+            Ok(PageTurn::AtLast)
+        ));
+    }
+
+    #[test]
+    fn page_label_formats_pages() {
+        assert_eq!(page_label(0, Some(50)), "page 1/1");
+        assert_eq!(page_label(1, Some(100)), "page 2/2");
+        assert_eq!(page_label(2, Some(101)), "page 3/3");
+        assert_eq!(page_label(4, Some(24310)), "page 5/487");
+        // Unknown or empty totals degrade to the page number only.
+        assert_eq!(page_label(2, None), "page 3");
+        assert_eq!(page_label(0, Some(0)), "page 1");
     }
 }

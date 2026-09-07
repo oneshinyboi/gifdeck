@@ -33,12 +33,7 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
         .map_err(|e| anyhow::anyhow!("failed to build http client: {e}"))
 }
 
-async fn cmd_search(
-    query: String,
-    source: String,
-    max: usize,
-    json: bool,
-) -> anyhow::Result<()> {
+async fn cmd_search(query: String, source: String, max: usize, json: bool) -> anyhow::Result<()> {
     let cfg = config::config();
     let client = http_client()?;
     let source = providers::Source::parse(&source)?;
@@ -75,10 +70,11 @@ async fn cmd_tui(query: Option<String>, favs_only: bool) -> anyhow::Result<()> {
     let cfg = config::config();
     let client = http_client()?;
 
-    let items = if favs_only {
+    let (heading, items, pager) = if favs_only {
         let favs = favs::FavsClient::new(cfg)?;
-        let listed = favs.list().await?;
-        listed
+        let listed = favs.list_page(app::PAGE_SIZE, 0).await?;
+        let items = listed
+            .items
             .into_iter()
             .map(|f| {
                 let title = if f.title.is_empty() {
@@ -92,10 +88,36 @@ async fn cmd_tui(query: Option<String>, favs_only: bool) -> anyhow::Result<()> {
                     preview_url: f.preview,
                 }
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (
+            "Favorites",
+            items,
+            Some(app::Pager::favs(favs, listed.total)),
+        )
     } else if let Some(q) = query {
-        let results = providers::search(&client, cfg, providers::Source::Auto, &q, 50).await?;
-        results.into_iter().map(app::UrlItem::from).collect::<Vec<_>>()
+        let page = providers::search_page(
+            &client,
+            cfg,
+            providers::Source::Auto,
+            &q,
+            app::PAGE_SIZE,
+            &providers::PageCursor::Start,
+        )
+        .await?;
+        let items = page
+            .results
+            .into_iter()
+            .map(app::UrlItem::from)
+            .collect::<Vec<_>>();
+        let pager = app::Pager::search(
+            client,
+            cfg.clone(),
+            providers::Source::Auto,
+            q,
+            page.next,
+            page.total,
+        );
+        ("Search", items, Some(pager))
     } else {
         eprintln!(
             "usage: gifdeck tui <query>         search a GIF grid\n\
@@ -105,8 +127,7 @@ async fn cmd_tui(query: Option<String>, favs_only: bool) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    let heading = if favs_only { "Favorites" } else { "Search" };
-    if let Some(url) = app::run(items, heading)? {
+    if let Some(url) = app::run(items, heading, pager).await? {
         println!("{url}");
         app::copy_to_clipboard(&url);
     }

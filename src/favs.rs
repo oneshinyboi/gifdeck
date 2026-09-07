@@ -25,6 +25,15 @@ pub struct FavItem {
     pub last_used: Option<String>,
 }
 
+/// One page of the favorites list plus the server-reported total.
+#[derive(Debug, Clone)]
+pub struct FavsPage {
+    pub items: Vec<FavItem>,
+    /// Total favorites on the server (`X-Total-Count`); `None` when the
+    /// server predates the header.
+    pub total: Option<usize>,
+}
+
 /// Response shape of `PATCH /favorites/{id}/use`.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)] // consumed by later sessions when use-tracking is surfaced in the TUI
@@ -74,17 +83,35 @@ impl FavsClient {
 
     /// GET /favorites → list sorted by the server.
     pub async fn list(&self) -> anyhow::Result<Vec<FavItem>> {
+        Ok(self.list_page(0, 0).await?.items)
+    }
+
+    /// GET /favorites?limit=&offset= → one page of the list plus the
+    /// server-reported total (`X-Total-Count` header; `None` when the
+    /// server predates it). `limit = 0` means "no limit" server-side,
+    /// matching `list()`.
+    pub async fn list_page(&self, limit: usize, offset: usize) -> anyhow::Result<FavsPage> {
         let resp = self
-            .authed(self.http.get(format!("{}/favorites", self.base)))
+            .authed(self.http.get(format!(
+                "{}/favorites?limit={limit}&offset={offset}",
+                self.base
+            )))
             .send()
             .await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(self.describe_error(resp, status, "list favorites").await);
         }
-        resp.json::<Vec<FavItem>>()
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok());
+        let items = resp
+            .json::<Vec<FavItem>>()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to parse favorites list: {e}"))
+            .map_err(|e| anyhow::anyhow!("failed to parse favorites list: {e}"))?;
+        Ok(FavsPage { items, total })
     }
 
     /// POST /favorites → upsert a favorite from a GifResult.
@@ -110,7 +137,11 @@ impl FavsClient {
             title: &gif.title,
         };
         let resp = self
-            .authed(self.http.post(format!("{}/favorites", self.base)).json(&body))
+            .authed(
+                self.http
+                    .post(format!("{}/favorites", self.base))
+                    .json(&body),
+            )
             .send()
             .await?;
         let status = resp.status();
@@ -135,7 +166,9 @@ impl FavsClient {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(self.describe_error(resp, status, "increment favorite use").await);
+            return Err(self
+                .describe_error(resp, status, "increment favorite use")
+                .await);
         }
         resp.json::<UseCount>()
             .await
@@ -147,10 +180,7 @@ impl FavsClient {
     pub async fn delete(&self, id: &str) -> anyhow::Result<()> {
         let path = urlenc(id);
         let resp = self
-            .authed(
-                self.http
-                    .delete(format!("{}/favorites/{path}", self.base)),
-            )
+            .authed(self.http.delete(format!("{}/favorites/{path}", self.base)))
             .send()
             .await?;
         let status = resp.status();
@@ -197,7 +227,7 @@ fn urlenc(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_gif() -> GifResult {
@@ -248,6 +278,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_page_sends_limit_and_offset() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/favorites"))
+            .and(query_param("limit", "50"))
+            .and(query_param("offset", "50"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-Total-Count", "137")
+                    .set_body_json(json!([])),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server.uri());
+        let page = client.list_page(50, 50).await.unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.total, Some(137));
+    }
+
+    #[tokio::test]
+    async fn list_page_total_absent_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/favorites"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server.uri());
+        let page = client.list_page(50, 0).await.unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.total, None);
+    }
+
+    #[tokio::test]
     async fn list_empty_is_ok() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -267,16 +333,14 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/favorites"))
             .and(header("X-Auth-Token", "sekret"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "id": "abc123",
-                    "url": "https://static.klipy.com/gifs/abc123.gif",
-                    "preview": "https://static.klipy.com/previews/abc123.gif",
-                    "provider": "klipy",
-                    "title": "test gif",
-                    "use_count": 1
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "abc123",
+                "url": "https://static.klipy.com/gifs/abc123.gif",
+                "preview": "https://static.klipy.com/previews/abc123.gif",
+                "provider": "klipy",
+                "title": "test gif",
+                "use_count": 1
+            })))
             .mount(&server)
             .await;
 
@@ -341,7 +405,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/favorites/nope"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "no such favorite"})))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({"error": "no such favorite"})),
+            )
             .mount(&server)
             .await;
 
@@ -356,7 +422,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/favorites"))
-            .respond_with(ResponseTemplate::new(502).set_body_json(json!({"error": "upstream down"})))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_json(json!({"error": "upstream down"})),
+            )
             .mount(&server)
             .await;
 
