@@ -5,7 +5,7 @@ GIPHY and KLIPY, manages a favorites list synced through a self-hosted server
 (`favs.veryshiny.net`), and feeds chosen GIFs into the Concord Discord TUI
 client via Ctrl+V paste.
 
-> MIT · © 2026 Diamond — this project reimplements the approach of gifgrep
+> GPL-3.0 · © 2026 Diamond — this project reimplements the approach of gifgrep
 > (MIT · © 2026 Peter Steinberger, steipete/gifgrep). See [LICENSE](LICENSE).
 
 ## Status
