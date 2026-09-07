@@ -16,7 +16,20 @@ actions:
   get-current-version:
     - sh -c "grep -m1 '^version' Cargo.toml | sed 's/.*\"\([0-9.]*\)\".*/\1/'"
   create-archive:
-    - sh -c "git archive --prefix=gifdeck-${PACKIT_PROJECT_VERSION}/ -o gifdeck-${PACKIT_PROJECT_VERSION}.tar.gz HEAD && echo gifdeck-${PACKIT_PROJECT_VERSION}.tar.gz"
+    # git archive alone would emit only the vendor/ gitlink (empty dir), so:
+    # init the submodule (github fetch is the proven-good network path in
+    # Copr's SRPM-prep chroot), stage the tree, copy vendor in, tar manually.
+    - sh -c "set -e
+        && git submodule update --init --depth 1 vendor >/dev/null
+        && rm -rf /tmp/gifdeck-stage && mkdir -p /tmp/gifdeck-stage
+        && git archive --prefix=gifdeck-${PACKIT_PROJECT_VERSION}/ HEAD | tar -x -C /tmp/gifdeck-stage
+        && mkdir -p /tmp/gifdeck-stage/gifdeck-${PACKIT_PROJECT_VERSION}/vendor
+        && cp -a vendor/. /tmp/gifdeck-stage/gifdeck-${PACKIT_PROJECT_VERSION}/vendor/
+        && rm -f /tmp/gifdeck-stage/gifdeck-${PACKIT_PROJECT_VERSION}/vendor/.git
+        && mkdir -p /tmp/gifdeck-stage/gifdeck-${PACKIT_PROJECT_VERSION}/.cargo
+        && cp rpm/cargo-vendor-config.toml /tmp/gifdeck-stage/gifdeck-${PACKIT_PROJECT_VERSION}/.cargo/config.toml
+        && tar -czf gifdeck-${PACKIT_PROJECT_VERSION}.tar.gz -C /tmp/gifdeck-stage gifdeck-${PACKIT_PROJECT_VERSION}
+        && echo gifdeck-${PACKIT_PROJECT_VERSION}.tar.gz"
 
 jobs:
   - job: copr_build
