@@ -72,7 +72,7 @@ grep linux-gnu.tar.gz SHA256SUMS | sha256sum -c -
 **Fedora** — RPMs are built in Copr from release tags (via Packit):
 
 ```
-dnf copr enable Shinediamond295/gifdeck
+dnf copr enable shinediamond295/gifdeck
 dnf install gifdeck
 ```
 
