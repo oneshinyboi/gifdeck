@@ -1,0 +1,25 @@
+# Packit builds Fedora RPMs in Copr from GitHub releases.
+#
+# Setup (one-time):
+#   1. Install the Packit GitHub app on this repository
+#      (https://github.com/apps/packit-as-a-service) — already installed.
+#   2. Copr account: Shinediamond295 (owner below must match it).
+# After the first release tagged v* you can enable the repo with:
+#   dnf copr enable <owner>/gifdeck
+#   dnf install gifdeck
+specfile_path: rpm/gifdeck.spec
+upstream_project_url: https://github.com/oneshinyboi/gifdeck
+upstream_package_name: gifdeck
+downstream_package_name: gifdeck
+
+actions:
+  get-current-version:
+    - sh -c "grep -m1 '^version' Cargo.toml | sed 's/.*\"\([0-9.]*\)\".*/\1/'"
+  create-archive:
+    - sh -c "git archive --prefix=gifdeck-${PACKIT_PROJECT_VERSION}/ -o gifdeck-${PACKIT_PROJECT_VERSION}.tar.gz HEAD"
+
+jobs:
+  - job: copr_build
+    trigger: release
+    owner: Shinediamond295
+    project: gifdeck

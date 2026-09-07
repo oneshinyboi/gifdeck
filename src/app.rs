@@ -623,7 +623,7 @@ impl App {
         }
         let jump = rows.max(1).saturating_mul(self.cols.max(1) as usize);
         let cur = self.grid().selected;
-        self.grid_mut().selected = if cur < jump { 0 } else { cur - jump };
+        self.grid_mut().selected = cur.saturating_sub(jump);
         self.ensure_visible();
     }
 

@@ -244,7 +244,7 @@ pub async fn copy_gif_file(http: &reqwest::Client, url: &str) -> anyhow::Result<
 /// Fresh temp file path under `<cache>/gifdeck/`.
 fn temp_gif_path() -> anyhow::Result<PathBuf> {
     let dir = dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(std::env::temp_dir()))
+        .unwrap_or_else(std::env::temp_dir)
         .join("gifdeck");
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", dir.display()))?;

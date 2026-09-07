@@ -65,7 +65,7 @@ pub enum PreviewEntry {
     Requested,
     Ready(CachedPreview),
     /// The failure reason is stored for future status surfacing (session 3).
-    Failed(String),
+    Failed(#[allow(dead_code)] String),
 }
 
 pub struct PreviewCache {

@@ -1,0 +1,194 @@
+name: Release
+
+# Cut a release by pushing a tag:
+#   git tag vX.Y.Z && git push origin vX.Y.Z
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATE: gifdeck
+  TAP_REPO: oneshinyboi/homebrew-tap
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          dir="${CRATE}-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$dir"
+          cp "target/${{ matrix.target }}/release/${CRATE}" "$dir/"
+          cp README.md LICENSE "$dir/"
+          tar czf "${dir}.tar.gz" "$dir"
+          rm -rf "$dir"
+      - name: Stage (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $VERSION = $env:GITHUB_REF_NAME.Substring(1)
+          $dir = "${env:CRATE}-$VERSION-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:CRATE}.exe" $dir
+          Copy-Item README.md, LICENSE $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          Remove-Item -Recurse -Force $dir
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+
+  publish-cratesio:
+    needs: github-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify the tag matches the crate version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CRATE_VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          if [ "$VERSION" != "$CRATE_VERSION" ]; then
+            echo "tag v$VERSION does not match Cargo.toml version $CRATE_VERSION" >&2
+            exit 1
+          fi
+      - name: Publish
+        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+
+  homebrew-tap:
+    needs: github-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Update tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          sha() { grep " ${CRATE}-${VERSION}-$1.tar.gz" dist/SHA256SUMS | awk '{print $1}'; }
+          MAC_ARM="$(sha aarch64-apple-darwin)"
+          MAC_X64="$(sha x86_64-apple-darwin)"
+          LINUX_ARM="$(sha aarch64-unknown-linux-gnu)"
+          LINUX_X64="$(sha x86_64-unknown-linux-gnu)"
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/${CRATE}.rb <<EOF
+          class Gifdeck < Formula
+            desc "GIF picker for the terminal: search, favorite, clipboard"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            version "${VERSION}"
+            license "GPL-3.0-only"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${BASE}/${CRATE}-${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${MAC_ARM}"
+              else
+                url "${BASE}/${CRATE}-${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${MAC_X64}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "${BASE}/${CRATE}-${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_ARM}"
+              else
+                url "${BASE}/${CRATE}-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_X64}"
+              end
+            end
+
+            def install
+              bin.install "${CRATE}"
+            end
+
+            def caveats
+              <<~EOS
+                Searching needs a GIPHY_API_KEY or KLIPY_API_KEY in
+                ~/.config/gifdeck/config.json (see the gifdeck README).
+              EOS
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "gifdeck-release-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add Formula/${CRATE}.rb
+          git commit -m "gifdeck ${VERSION}" || echo "formula unchanged"
+          git push
