@@ -6,7 +6,8 @@ clipboard — as the actual animated GIF file, or just as a link.
 
 - **Search** — GIPHY and KLIPY, with paging
 - **Favorites** — stored locally by default, or synced through your own
-  self-hosted favorites server
+  self-hosted favorites server,
+  [gifdeck-server](https://github.com/oneshinyboi/gifdeck-server)
 - **Live previews** — animated GIF cells in Kitty, Ghostty, and other
   terminals that support the Kitty graphics protocol; a clean
   title-only grid everywhere else
@@ -17,6 +18,7 @@ clipboard — as the actual animated GIF file, or just as a link.
 
 ## Contents
 
+- [Install](#install)
 - [Building](#building)
 - [Quick start](#quick-start)
 - [Usage](#usage)
@@ -25,6 +27,54 @@ clipboard — as the actual animated GIF file, or just as a link.
 - [Configuration](#configuration)
 - [File locations](#file-locations)
 - [Development](#development)
+
+## Install
+
+**cargo** (any platform with Rust):
+
+```
+cargo install gifdeck
+```
+
+With `cargo-binstall` installed, `cargo binstall gifdeck` grabs the
+prebuilt release binary instead of compiling.
+
+**Homebrew** (macOS and Linux):
+
+```
+brew install oneshinyboi/tap/gifdeck
+```
+
+**Prebuilt binaries** — download from
+[GitHub releases](https://github.com/oneshinyboi/gifdeck/releases):
+
+| Archive                                               | Platform                        |
+| ----------------------------------------------------- | ------------------------------- |
+| `gifdeck-<ver>-x86_64-unknown-linux-gnu.tar.gz`       | Linux x86_64 (glibc)            |
+| `gifdeck-<ver>-x86_64-unknown-linux-musl.tar.gz`      | Linux x86_64 (static, any distro) |
+| `gifdeck-<ver>-aarch64-unknown-linux-gnu.tar.gz`      | Linux aarch64                   |
+| `gifdeck-<ver>-aarch64-apple-darwin.tar.gz`           | macOS Apple silicon             |
+| `gifdeck-<ver>-x86_64-apple-darwin.tar.gz`            | macOS Intel                     |
+| `gifdeck-<ver>-x86_64-pc-windows-msvc.zip`            | Windows x86_64                  |
+
+Verify a download against the release's `SHA256SUMS`:
+
+```
+grep linux-gnu.tar.gz SHA256SUMS | sha256sum -c -
+```
+
+**Fedora** — RPMs are built in Copr from release tags (via Packit):
+
+```
+dnf copr enable oneshinyboi/gifdeck
+dnf install gifdeck
+```
+
+Platform notes: clipboard actions need `wl-copy` (Wayland) or `xclip`
+(X11); on Windows they are unavailable and report the failure in the
+footer. Inline animated previews require a terminal with Kitty graphics
+support (Kitty, Ghostty, …); everywhere else the grid falls back to
+titles and the picker stays fully usable.
 
 ## Building
 
@@ -161,7 +211,9 @@ you which mode you're in (`★ saved to favorites` vs.
   out of the box.
 - **Server mode** — favorites sync through a self-hosted favorites
   server (`X-Auth-Token` auth), so the same list follows you across
-  machines.
+  machines. [gifdeck-server](https://github.com/oneshinyboi/gifdeck-server)
+  is the reference implementation; its README covers the API and
+  deployment.
 
 The two never mix on their own. To move between them, use the explicit
 transfer commands:
@@ -212,7 +264,7 @@ server-mode favorites need the favorites API and token.
 | ------------------------- | ------------------------------------------------ | ------------------------------------------------ |
 | `KLIPY_API_KEY`           | searching (one of the two keys suffices)         | KLIPY search API key                             |
 | `GIPHY_API_KEY`           | searching (one of the two keys suffices)         | GIPHY search API key                             |
-| `GIFDECK_FAVORITES_API`   | server-mode favorites only                       | favorites server base URL, e.g. `https://your-host/api/v1` (no default) |
+| `GIFDECK_FAVORITES_API`   | server-mode favorites only                       | gifdeck-server base URL, e.g. `https://your-host/api/v1` (no default) |
 | `GIFDECK_FAVORITES_TOKEN` | server-mode favorites                            | favorites server auth token                      |
 | `FAVORITES_MODE`          | forcing a favorites mode (otherwise optional)    | `server` or `local`                              |
 
