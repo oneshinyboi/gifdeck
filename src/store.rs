@@ -280,7 +280,9 @@ mod tests {
 
         let items = s.load().unwrap();
         assert_eq!(items[0].use_count, 2, "bump is persisted");
-        assert_eq!(items[0].last_used, first.last_used);
+        // Compare against the last write: `first` and `second` may land
+        // on different epoch seconds, so `first` would race.
+        assert_eq!(items[0].last_used, second.last_used);
         // added_at is preserved, like upsert does.
         assert_eq!(items[0].added_at, fav.added_at);
     }
