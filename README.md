@@ -22,6 +22,26 @@ a local JSON store — whichever is configured, exclusively.
 
 Not yet implemented (next session): public readiness.
 
+## TODO
+
+1. **Local-mode TUI verification** — the interactive Favorites-tab `v`
+   flow (Tab → Favorites, toggle against the local store) has only been
+   verified via unit tests (`toggle_local_backend_*`), not driven in a
+   live terminal session.
+2. **Wire `increment_use` on pick** — `FavsClient::increment_use`
+   (`PATCH /favorites/{id}/use`) is still dead code. When a picked/copied
+   GIF is a favorite, bump its `use_count`/`last_used`. Needs: a decision
+   on what counts as a "use" (Enter/Space pick only, or also `c`/`y`
+   copies), an `increment_use` on `FavsBackend`/`LocalStore` so local
+   mode has semantics too, and possibly sort-by-use later.
+3. **Explicit favorites-mode override** — mode is purely
+   token-presence-based. A `FAVORITES_MODE` config key (server|local)
+   would let someone run the local store while keeping server
+   credentials in the config.
+4. **`favs --import` failure detail** — import currently reports only a
+   summary count ("imported N/M"); it should say which favorites failed
+   and why.
+
 ## Usage
 
 ```
