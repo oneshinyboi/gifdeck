@@ -16,7 +16,7 @@ actions:
   get-current-version:
     - sh -c "grep -m1 '^version' Cargo.toml | sed 's/.*\"\([0-9.]*\)\".*/\1/'"
   create-archive:
-    - sh -c "git archive --prefix=gifdeck-${PACKIT_PROJECT_VERSION}/ -o gifdeck-${PACKIT_PROJECT_VERSION}.tar.gz HEAD"
+    - sh -c "git archive --prefix=gifdeck-${PACKIT_PROJECT_VERSION}/ -o gifdeck-${PACKIT_PROJECT_VERSION}.tar.gz HEAD && echo gifdeck-${PACKIT_PROJECT_VERSION}.tar.gz"
 
 jobs:
   - job: copr_build
