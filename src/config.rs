@@ -234,7 +234,10 @@ mod tests {
         let in_gifdeck = path
             .components()
             .any(|c| c == std::path::Component::Normal(std::ffi::OsStr::new("gifdeck")));
-        assert!(in_gifdeck, "config lives under a gifdeck directory: {path:?}");
+        assert!(
+            in_gifdeck,
+            "config lives under a gifdeck directory: {path:?}"
+        );
         assert!(
             !path.to_string_lossy().contains("gifgrep"),
             "no gifgrep references: {path:?}"
@@ -244,9 +247,7 @@ mod tests {
     #[test]
     fn favorites_mode_local_overrides_token() {
         let _guard = env_lock();
-        let _path = with_config(
-            r#"{"GIFDECK_FAVORITES_TOKEN":"tok","FAVORITES_MODE":"local"}"#,
-        );
+        let _path = with_config(r#"{"GIFDECK_FAVORITES_TOKEN":"tok","FAVORITES_MODE":"local"}"#);
         let cfg = load();
         assert_eq!(cfg.favorites_mode.as_deref(), Some("local"));
         assert!(
@@ -279,9 +280,7 @@ mod tests {
     #[test]
     fn favorites_mode_invalid_falls_back_to_token_presence() {
         let _guard = env_lock();
-        let _path = with_config(
-            r#"{"GIFDECK_FAVORITES_TOKEN":"tok","FAVORITES_MODE":"neither"}"#,
-        );
+        let _path = with_config(r#"{"GIFDECK_FAVORITES_TOKEN":"tok","FAVORITES_MODE":"neither"}"#);
         let cfg = load();
         assert_eq!(cfg.favorites_mode, None, "invalid mode is unset");
         assert!(cfg.use_server_favorites(), "falls back to token presence");

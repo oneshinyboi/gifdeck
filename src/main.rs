@@ -26,9 +26,11 @@ async fn main() -> anyhow::Result<()> {
             max,
             json,
         }) => cmd_search(query, source, max, json).await,
-        Some(Command::Favs { json, export, import }) => {
-            cmd_favs(json, export, import).await
-        }
+        Some(Command::Favs {
+            json,
+            export,
+            import,
+        }) => cmd_favs(json, export, import).await,
         Some(Command::Tui { query, favs }) => cmd_tui(query, favs).await,
     }
 }
@@ -142,12 +144,7 @@ async fn cmd_tui(query: Option<String>, favs_only: bool) -> anyhow::Result<()> {
         }
     };
 
-    let mut picker = app::App::new(
-        cfg.clone(),
-        http.clone(),
-        providers::Source::Auto,
-        backend,
-    );
+    let mut picker = app::App::new(cfg.clone(), http.clone(), providers::Source::Auto, backend);
     picker.set_fav_ids(ids);
     if let Some(s) = initial_status {
         picker.set_status(s);

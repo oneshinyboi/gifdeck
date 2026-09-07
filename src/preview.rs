@@ -98,11 +98,7 @@ impl PreviewCache {
     /// re-insert and evict a visible entry (the load/unload thrash loop).
     fn evict(&mut self) {
         while self.map.len() > self.cap {
-            let Some(idx) = self
-                .lru
-                .iter()
-                .position(|u| !self.loading.contains(u))
-            else {
+            let Some(idx) = self.lru.iter().position(|u| !self.loading.contains(u)) else {
                 break;
             };
             let oldest = self.lru.remove(idx).expect("index from iter() is valid");

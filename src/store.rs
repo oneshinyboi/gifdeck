@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::favs::{FavItem, now_epoch};
+use crate::favs::{now_epoch, FavItem};
 use crate::providers::GifResult;
 
 #[derive(Debug, Clone)]
@@ -60,9 +60,10 @@ impl LocalStore {
     }
 
     /// Atomically replace the store: write a temp file in the same
-    /// directory (0600 — favorites data, same class as the config file)
-    /// and rename over the old one, so a crash never leaves a partial
-    /// store.
+    /// directory (0600 on Unix — favorites data, same class as the
+    /// config file) and rename over the old one, so a crash never
+    /// leaves a partial store. On Windows the user-profile ACLs already
+    /// provide the equivalent protection.
     pub fn save_all(&self, items: &[FavItem]) -> Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)
@@ -71,18 +72,18 @@ impl LocalStore {
         let json = serde_json::to_string_pretty(items)?;
         let tmp = self.path.with_extension("json.tmp");
         {
-            use std::os::unix::fs::PermissionsExt;
             let mut f = std::fs::File::create(&tmp)
                 .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", tmp.display()))?;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
             f.write_all(json.as_bytes())?;
         }
         std::fs::rename(&tmp, &self.path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            anyhow::anyhow!(
-                "failed to move {} into place: {e}",
-                self.path.display()
-            )
+            anyhow::anyhow!("failed to move {} into place: {e}", self.path.display())
         })?;
         Ok(())
     }
@@ -201,10 +202,14 @@ mod tests {
         // No temp file left behind…
         let tmp = s.path().with_extension("json.tmp");
         assert!(!tmp.exists());
-        // …and the store is 0600 (favorites data is secret-class).
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(s.path()).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        // …and on Unix the store is 0600 (favorites data is
+        // secret-class; Windows relies on profile ACLs instead).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(s.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[test]

@@ -115,11 +115,7 @@ pub async fn download_gif(http: &reqwest::Client, url: &str) -> anyhow::Result<P
 /// Save the GIF at `url` into `dir` under a filename derived from the URL
 /// (the "save to disk" action). Never silently overwrites: an existing
 /// file gets a ` (n)` suffix before the extension.
-pub async fn download_to(
-    http: &reqwest::Client,
-    url: &str,
-    dir: &Path,
-) -> anyhow::Result<PathBuf> {
+pub async fn download_to(http: &reqwest::Client, url: &str, dir: &Path) -> anyhow::Result<PathBuf> {
     let bytes = fetch_gif_bytes(http, url).await?;
     let path = unique_path(dir, &gif_name_from_url(url))?;
     std::fs::write(&path, &bytes)
@@ -210,9 +206,8 @@ fn unique_path(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
 /// descriptor after unlink).
 pub fn place_gif_on_clipboard(path: &Path) -> anyhow::Result<()> {
     let result = (|| -> anyhow::Result<()> {
-        let tool = ClipboardTool::detect().ok_or_else(|| {
-            anyhow::anyhow!("no clipboard tool found (install wl-copy or xclip)")
-        })?;
+        let tool = ClipboardTool::detect()
+            .ok_or_else(|| anyhow::anyhow!("no clipboard tool found (install wl-copy or xclip)"))?;
         let mut cmd = tool.gif_command(path);
         if matches!(tool, ClipboardTool::WlCopy) {
             cmd.stdin(std::fs::File::open(path)?);
@@ -252,21 +247,28 @@ fn temp_gif_path() -> anyhow::Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Ok(dir.join(format!(
-        "gifdeck-{}-{nanos}.gif",
-        std::process::id()
-    )))
+    Ok(dir.join(format!("gifdeck-{}-{nanos}.gif", std::process::id())))
 }
 
 /// Whether `name` is an executable file on `$PATH`.
 fn in_path(name: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| is_executable(dir.join(name)))
-        })
+        .map(|paths| std::env::split_paths(&paths).any(|dir| is_executable(dir.join(name))))
         .unwrap_or(false)
 }
 
+/// Whether `path` is an existing file — the Windows notion of
+/// "executable on PATH" (extension resolution is the caller's business,
+/// and the tools we look for don't exist on Windows anyway).
+#[cfg(windows)]
+fn is_executable(path: PathBuf) -> bool {
+    std::fs::metadata(&path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+/// Whether `path` is an executable file (Unix execute bits set).
+#[cfg(unix)]
 fn is_executable(path: PathBuf) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(&path) {
@@ -353,19 +355,25 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path =
-            download_to(&reqwest::Client::new(), &format!("{}/cats/cat-01.gif", server.uri()), &dir)
-                .await
-                .unwrap();
+        let path = download_to(
+            &reqwest::Client::new(),
+            &format!("{}/cats/cat-01.gif", server.uri()),
+            &dir,
+        )
+        .await
+        .unwrap();
         assert_eq!(path, dir.join("cat-01.gif"));
         assert_eq!(std::fs::read(&path).unwrap(), gif);
 
         // A second save of the same URL must not overwrite: it gets a
         // ` (1)` suffix.
-        let path2 =
-            download_to(&reqwest::Client::new(), &format!("{}/cats/cat-01.gif", server.uri()), &dir)
-                .await
-                .unwrap();
+        let path2 = download_to(
+            &reqwest::Client::new(),
+            &format!("{}/cats/cat-01.gif", server.uri()),
+            &dir,
+        )
+        .await
+        .unwrap();
         assert_eq!(path2, dir.join("cat-01 (1).gif"));
 
         std::fs::remove_dir_all(&dir).unwrap();

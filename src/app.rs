@@ -151,11 +151,20 @@ pub enum PageDir {
 /// event loop (which updates the footer and use-tracking).
 enum JobResult {
     /// `c`: GIF downloaded and placed on the clipboard.
-    CopiedGif { id: String, result: anyhow::Result<()> },
+    CopiedGif {
+        id: String,
+        result: anyhow::Result<()>,
+    },
     /// `D`: GIF saved to a directory.
-    SavedGif { id: String, result: anyhow::Result<std::path::PathBuf> },
+    SavedGif {
+        id: String,
+        result: anyhow::Result<std::path::PathBuf>,
+    },
     /// `y`: URL copied as text.
-    CopiedUrl { id: String, result: anyhow::Result<()> },
+    CopiedUrl {
+        id: String,
+        result: anyhow::Result<()>,
+    },
 }
 
 /// Outcome of a page-turn attempt.
@@ -284,8 +293,7 @@ impl Pager {
                     }
                 };
                 let fetched =
-                    providers::search_page(client, cfg, *source, query, PAGE_SIZE, &cursor)
-                        .await?;
+                    providers::search_page(client, cfg, *source, query, PAGE_SIZE, &cursor).await?;
                 if fetched.results.is_empty() {
                     // Restore the cursor we popped so d still works after.
                     if matches!(dir, PageDir::Prev) {
@@ -328,11 +336,7 @@ impl Pager {
                 if fetched.items.is_empty() {
                     return Ok(PageTurn::AtLast);
                 }
-                let items = fetched
-                    .items
-                    .into_iter()
-                    .map(UrlItem::from)
-                    .collect();
+                let items = fetched.items.into_iter().map(UrlItem::from).collect();
                 Ok(PageTurn::Page(items))
             }
         }
@@ -612,7 +616,11 @@ impl App {
         }
         let jump = rows.max(1).saturating_mul(self.cols.max(1) as usize);
         let cur = self.grid().selected;
-        self.grid_mut().selected = if cur + jump >= len { len - 1 } else { cur + jump };
+        self.grid_mut().selected = if cur + jump >= len {
+            len - 1
+        } else {
+            cur + jump
+        };
         self.ensure_visible();
     }
 
@@ -903,12 +911,7 @@ impl App {
             Ok(_) => {
                 if self.tab == Tab::Favorites {
                     self.refresh_favorites_page().await;
-                    if let Some(pos) = self
-                        .favorites
-                        .items
-                        .iter()
-                        .position(|i| i.id == id)
-                    {
+                    if let Some(pos) = self.favorites.items.iter().position(|i| i.id == id) {
                         self.favorites.selected = pos;
                     }
                 }
@@ -1056,7 +1059,9 @@ impl App {
                 self.query.clear()
             }
             KeyCode::Char(c)
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.query.push(c);
             }
@@ -2014,13 +2019,15 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/favorites"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "id0",
-                "url": "https://gifdeck.test/0.gif",
-                "preview": "https://gifdeck.test/0-preview.gif",
-                "provider": "klipy",
-                "title": "gif 0"
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "id0",
+                    "url": "https://gifdeck.test/0.gif",
+                    "preview": "https://gifdeck.test/0-preview.gif",
+                    "provider": "klipy",
+                    "title": "gif 0"
+                })),
+            )
             .mount(&server)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("DELETE"))
@@ -2041,11 +2048,19 @@ mod tests {
         assert!(!app.fav_ids.contains("id0"));
         app.toggle_favorite().await;
         assert!(app.fav_ids.contains("id0"));
-        assert!(app.status.as_deref().unwrap().contains("saved to favorites"));
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("saved to favorites"));
 
         app.toggle_favorite().await;
         assert!(!app.fav_ids.contains("id0"));
-        assert!(app.status.as_deref().unwrap().contains("removed from favorites"));
+        assert!(app
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("removed from favorites"));
     }
 
     #[tokio::test]
@@ -2117,7 +2132,10 @@ mod tests {
         app.search.items = items(1);
 
         app.toggle_favorite().await;
-        assert!(app.fav_ids.is_empty(), "a damaged store must not be toggled");
+        assert!(
+            app.fav_ids.is_empty(),
+            "a damaged store must not be toggled"
+        );
         let status = app.status.as_deref().unwrap();
         assert!(status.contains("favorite failed"), "got: {status}");
         let _ = std::fs::remove_file(&path);
@@ -2129,10 +2147,12 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("PATCH"))
             .and(wiremock::matchers::path("/favorites/id0/use"))
             .and(wiremock::matchers::header("X-Auth-Token", "sekret"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "id0",
-                "use_count": 1
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "id0",
+                    "use_count": 1
+                })),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -2148,7 +2168,10 @@ mod tests {
         app.fav_ids.insert("id0".into());
 
         app.choose();
-        assert_eq!(app.selected_url.as_deref(), Some("https://gifdeck.test/0.gif"));
+        assert_eq!(
+            app.selected_url.as_deref(),
+            Some("https://gifdeck.test/0.gif")
+        );
         assert!(app.should_quit);
         assert_eq!(app.pending, Some(Pending::Use("id0".into())));
 
@@ -2274,7 +2297,12 @@ mod tests {
         // The store itself was updated too.
         let stored = LocalStore::at(&path).load().unwrap();
         assert_eq!(stored.iter().find(|f| f.id == "b1").unwrap().use_count, 1);
-        assert!(stored.iter().find(|f| f.id == "b1").unwrap().last_used.is_some());
+        assert!(stored
+            .iter()
+            .find(|f| f.id == "b1")
+            .unwrap()
+            .last_used
+            .is_some());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2310,9 +2338,7 @@ mod tests {
         let gif: &[u8] = b"GIF89a-fake-bytes";
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/0.gif"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_bytes(gif.to_vec()),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(gif.to_vec()))
             .mount(&server)
             .await;
 
@@ -2462,9 +2488,11 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/favorites"))
             .and(wiremock::matchers::query_param("offset", "50"))
-            .respond_with(wiremock::ResponseTemplate::new(200)
-                .insert_header("X-Total-Count", "1")
-                .set_body_json(serde_json::json!([])))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("X-Total-Count", "1")
+                    .set_body_json(serde_json::json!([])),
+            )
             .mount(&server)
             .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
