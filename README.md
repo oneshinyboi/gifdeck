@@ -13,6 +13,19 @@ clipboard — as the actual animated GIF file, or just as a link.
 - **Clipboard-ready** — copy a GIF as a real `image/gif` attachment, or
   just its URL
 
+![The gifdeck picker showing an animated GIF grid](assets/example.png)
+
+## Contents
+
+- [Building](#building)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+- [The picker](#the-picker)
+- [Favorites](#favorites)
+- [Configuration](#configuration)
+- [File locations](#file-locations)
+- [Development](#development)
+
 ## Building
 
 Requires Rust. From the project root:
