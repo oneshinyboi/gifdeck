@@ -57,7 +57,7 @@ the TUI falls back to a title-only grid with a footer note, so it never
 crashes in a plain terminal emulator.
 
 ```
-← → ↑ ↓ / h j k l   move (wrapping), PgUp/PgDn scroll within the page
+← → ↑ ↓ / h j k l   move (wrapping)
 d                    discard the page and fetch the next 50 results
 u                    go back to the previous page (no-op on the first)
 Enter / Space       select the GIF, printing its URL

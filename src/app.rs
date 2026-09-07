@@ -442,14 +442,6 @@ impl App {
         self.ensure_visible();
     }
 
-    fn page_down(&mut self) {
-        self.scroll_down(self.rows.max(1) as usize);
-    }
-
-    fn page_up(&mut self) {
-        self.scroll_up(self.rows.max(1) as usize);
-    }
-
     fn half_page_down(&mut self) {
         self.scroll_down(((self.rows.max(1) / 2) as usize).max(1));
     }
@@ -514,8 +506,6 @@ impl App {
             }
             KeyCode::Char('h') | KeyCode::Left => self.step(|i| nav_left(i, len)),
             KeyCode::Char('l') | KeyCode::Right => self.step(|i| nav_right(i, len)),
-            KeyCode::PageDown => self.page_down(),
-            KeyCode::PageUp => self.page_up(),
             // Plain d/u page the grid; Ctrl+D/Ctrl+U still work as aliases
             // (the code is Char('d')/'u' either way).
             KeyCode::Char('d') => {
@@ -630,7 +620,7 @@ impl App {
             .map(|s| format!(" · {s}"))
             .unwrap_or_default();
         let footer = format!(
-            "{} items{page_note} · ←↑↓→ / hjkl move · PgUp/PgDn scroll · d next page / u previous page · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}{status_note}",
+            "{} items{page_note} · ←↑↓→ / hjkl move · d next page / u previous page · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}{status_note}",
             self.items.len()
         );
         frame.render_widget(Paragraph::new(footer), footer_area);
