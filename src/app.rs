@@ -128,6 +128,8 @@ pub enum Pending {
     Toggle,
     /// Download the selected GIF and copy it as image/gif (c).
     CopyGif,
+    /// Download the selected GIF to the user's download folder (D).
+    Download,
     /// Copy the selected GIF's URL as text (y).
     CopyUrl,
     /// Record a "use" of a favorite by id (pick / c / y).
@@ -784,6 +786,27 @@ impl App {
         }
     }
 
+    /// Save the selected GIF to the download folder
+    /// (`$GIF_DOWNLOAD_PATH`, else the user's downloads directory).
+    async fn download_gif(&mut self) {
+        let dir = clipboard::download_dir();
+        self.download_gif_to(&dir).await;
+    }
+
+    /// Save the selected GIF to an explicit directory.
+    async fn download_gif_to(&mut self, dir: &std::path::Path) {
+        let Some(item) = self.active_item().cloned() else {
+            return;
+        };
+        match clipboard::download_to(&self.http, &item.url, dir).await {
+            Ok(path) => {
+                self.status = Some(format!("saved to {}", path.display()));
+                self.record_use(&item.id).await;
+            }
+            Err(e) => self.status = Some(format!("download failed: {e}")),
+        }
+    }
+
     /// Copy the selected GIF's URL as text. Returns whether the copy succeeded.
     fn copy_url(&mut self) -> bool {
         let Some(item) = self.active_item().cloned() else {
@@ -890,13 +913,17 @@ impl App {
             }
             KeyCode::Char('h') | KeyCode::Left => self.step(|i| nav_left(i, len)),
             KeyCode::Char('l') | KeyCode::Right => self.step(|i| nav_right(i, len)),
-            // Plain d/u page the grid; Ctrl+D/Ctrl+U still work as aliases
-            // (the code is Char('d')/'u' either way).
+            // Plain d pages (half-page); Shift+D downloads the selected GIF.
             KeyCode::Char('d') => {
                 if self.grid().pager.is_some() {
                     self.pending = Some(Pending::Page(PageDir::Next));
                 } else {
                     self.half_page_down();
+                }
+            }
+            KeyCode::Char('D') => {
+                if self.active_item().is_some() {
+                    self.pending = Some(Pending::Download);
                 }
             }
             KeyCode::Char('u') => {
@@ -1084,7 +1111,7 @@ impl App {
             ""
         };
         let action_line =
-            format!("Tab switch · c copy gif · y copy url · v favorite{mode_note}{status_note}");
+            format!("Tab switch · D download · c copy gif · y copy url · v favorite{mode_note}{status_note}");
 
         let [footer_nav, footer_actions] = Layout::default()
             .direction(Direction::Vertical)
@@ -1302,6 +1329,11 @@ pub async fn run(mut app: App) -> Result<Option<String>> {
                     app.status = Some("copying gif…".into());
                     terminal.draw(|f| app.draw(f))?;
                     app.copy_gif().await;
+                }
+                Some(Pending::Download) => {
+                    app.status = Some("downloading gif…".into());
+                    terminal.draw(|f| app.draw(f))?;
+                    app.download_gif().await;
                 }
                 Some(Pending::CopyUrl) => {
                     if app.copy_url() {
@@ -1579,6 +1611,8 @@ mod tests {
 
     #[test]
     fn d_and_u_half_page_without_pager() {
+        // Without a pager, plain d half-page scrolls down (Shift+D
+        // downloads) and u half-page scrolls up.
         let mut down = test_app(items(40));
         down.cols = 4;
         down.rows = 6;
@@ -1592,13 +1626,6 @@ mod tests {
         up.search.selected = 30;
         up.handle_key(key(KeyCode::Char('u')));
         assert_eq!(up.search.selected, 18);
-
-        let mut c = test_app(items(40));
-        c.cols = 4;
-        c.rows = 6;
-        c.search.selected = 0;
-        c.handle_key(ctrl('d'));
-        assert_eq!(c.search.selected, 12);
     }
 
     #[test]
@@ -1635,10 +1662,6 @@ mod tests {
         app.handle_key(key(KeyCode::Char('d')));
         assert_eq!(app.pending, Some(Pending::Page(PageDir::Next)));
         assert_eq!(app.search.selected, 7, "cursor does not move when paging");
-
-        app.pending = None;
-        app.handle_key(ctrl('d'));
-        assert_eq!(app.pending, Some(Pending::Page(PageDir::Next)));
     }
 
     #[test]
@@ -2194,6 +2217,72 @@ mod tests {
         let stored = LocalStore::at(&path).load().unwrap();
         assert_eq!(stored.iter().find(|f| f.id == "b1").unwrap().use_count, 1);
         assert!(stored.iter().find(|f| f.id == "b1").unwrap().last_used.is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn d_key_pages_and_shift_d_downloads() {
+        let mut app = test_app(items(3));
+        app.search.pager = Some(search_pager(None, None));
+
+        // Plain d pages to the next set.
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.pending, Some(Pending::Page(PageDir::Next)));
+
+        // Shift+D queues a download of the selected GIF.
+        app.pending = None;
+        app.handle_key(key(KeyCode::Char('D')));
+        assert_eq!(app.pending, Some(Pending::Download));
+    }
+
+    #[tokio::test]
+    async fn download_saves_to_dir_and_bumps_favorite_use() {
+        let server = wiremock::MockServer::start().await;
+        let gif: &[u8] = b"GIF89a-fake-bytes";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/0.gif"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(gif.to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let path = local_store_path();
+        let backend = FavsBackend::Local(LocalStore::at(&path));
+        backend.save(&items(1)[0].to_gif_result()).await.unwrap();
+
+        let mut app = App::new(
+            Config::default(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            backend,
+        );
+        app.search.items = items(1);
+        app.search.items[0].url = format!("{}/0.gif", server.uri());
+        app.fav_ids.insert("id0".into());
+
+        let dir = std::env::temp_dir().join(format!(
+            "gifdeck-app-dl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.download_gif_to(&dir).await;
+
+        let saved = dir.join("0.gif");
+        assert!(saved.exists());
+        assert_eq!(std::fs::read(&saved).unwrap(), gif);
+        assert!(
+            app.status.as_deref().unwrap().contains("saved to"),
+            "got: {:?}",
+            app.status
+        );
+
+        // Downloading a favorite counts as a use.
+        let stored = LocalStore::at(&path).load().unwrap();
+        assert_eq!(stored[0].use_count, 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(&path);
     }
 

@@ -89,7 +89,7 @@ picker works everywhere, it just looks simpler without graphics support.
 Tab: [Search] [Favorites]  q quit
  > type a query… (/ focus, Enter search)
  ☆ 0001 · title   ★ 0002 · title   …
- 12/50 · page 1/3 · u/d page · Tab switch · c copy gif · y copy url · v favorite
+  12/50 · page 1/3 · u/d page · D download · c copy gif · y copy url · v favorite
 ```
 
 ### Keys
@@ -104,6 +104,7 @@ Enter               run the search / choose the selected GIF (prints its URL)
 Space               choose the selected GIF
 Tab                 switch between Search and Favorites
 c                   copy the GIF file to the clipboard as image/gif
+D                   download the GIF to your downloads folder
 y                   copy the GIF URL as text
 v                   favorite / unfavorite the selected GIF
 q / Esc / Ctrl+C    quit (Esc clears/blurs the search box when focused)
@@ -111,8 +112,8 @@ q / Esc / Ctrl+C    quit (Esc clears/blurs the search box when focused)
 
 Notes:
 
-- **Paging** — `d`/`u` load the next/previous page (Ctrl+D/Ctrl+U work
-  as aliases). The footer shows `page N/M` when the source reports a
+- **Paging** — `d`/`u` load the next/previous page (Ctrl+U clears the
+  search box). The footer shows `page N/M` when the source reports a
   total and `page N` otherwise; at the end of the results the current
   page is kept and the footer says there are no more.
 - **Choosing** — Enter/Space print the chosen GIF's URL and copy it to

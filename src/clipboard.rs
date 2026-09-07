@@ -105,6 +105,42 @@ pub fn copy_text_quiet(text: &str) {
 /// `<cache>/gifdeck/` and return its path. The caller is responsible for
 /// removing the file (see `place_gif_on_clipboard`).
 pub async fn download_gif(http: &reqwest::Client, url: &str) -> anyhow::Result<PathBuf> {
+    let bytes = fetch_gif_bytes(http, url).await?;
+    let path = temp_gif_path()?;
+    std::fs::write(&path, &bytes)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Save the GIF at `url` into `dir` under a filename derived from the URL
+/// (the "save to disk" action). Never silently overwrites: an existing
+/// file gets a ` (n)` suffix before the extension.
+pub async fn download_to(
+    http: &reqwest::Client,
+    url: &str,
+    dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let bytes = fetch_gif_bytes(http, url).await?;
+    let path = unique_path(dir, &gif_name_from_url(url))?;
+    std::fs::write(&path, &bytes)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Where the `d` action saves GIFs: `$GIF_DOWNLOAD_PATH` when set, else
+/// the user's downloads directory, else the home directory.
+pub fn download_dir() -> PathBuf {
+    if let Some(p) = std::env::var_os("GIF_DOWNLOAD_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+async fn fetch_gif_bytes(http: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
     let bytes = http
         .get(url)
         .send()
@@ -115,10 +151,58 @@ pub async fn download_gif(http: &reqwest::Client, url: &str) -> anyhow::Result<P
         .bytes()
         .await
         .map_err(|e| anyhow::anyhow!("download failed: {e}"))?;
-    let path = temp_gif_path()?;
-    std::fs::write(&path, &bytes)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
-    Ok(path)
+    Ok(bytes.to_vec())
+}
+
+/// Derive a safe filename from a GIF URL's last path segment, always
+/// ending in `.gif` (empty/unsafe segments fall back to `gifdeck`).
+fn gif_name_from_url(url: &str) -> String {
+    let segment = url
+        .split(['?', '#'])
+        .next()
+        .and_then(|p| p.rsplit('/').next())
+        .unwrap_or("");
+    let mut name = String::new();
+    for ch in segment.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ' ') {
+            name.push(ch);
+        } else {
+            name.push('_');
+        }
+    }
+    let name = name.trim().trim_matches('.');
+    let mut name = if name.is_empty() {
+        "gifdeck".to_string()
+    } else {
+        name.to_string()
+    };
+    if !name.to_ascii_lowercase().ends_with(".gif") {
+        name.push_str(".gif");
+    }
+    name
+}
+
+/// `dir/name`, bumped to `dir/name (1)`, `(2)`, … while the file exists.
+fn unique_path(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let path = dir.join(name);
+    if !path.exists() {
+        return Ok(path);
+    }
+    let stem = Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string());
+    let ext = Path::new(name)
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 1..u64::MAX {
+        let candidate = dir.join(format!("{stem} ({n}){ext}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("could not find a free filename in {}", dir.display())
 }
 
 /// Place a GIF file's bytes on the clipboard as `image/gif`, then remove
@@ -248,6 +332,64 @@ mod tests {
         assert!(path.to_string_lossy().contains("gifdeck"), "{path:?}");
         assert_eq!(std::fs::read(&path).unwrap(), gif);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_to_saves_derived_name_and_bytes() {
+        let server = MockServer::start().await;
+        let gif: &[u8] = b"GIF89a-fake-bytes";
+        Mock::given(method("GET"))
+            .and(path("/cats/cat-01.gif"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(gif.to_vec()))
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!(
+            "gifdeck-dl-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path =
+            download_to(&reqwest::Client::new(), &format!("{}/cats/cat-01.gif", server.uri()), &dir)
+                .await
+                .unwrap();
+        assert_eq!(path, dir.join("cat-01.gif"));
+        assert_eq!(std::fs::read(&path).unwrap(), gif);
+
+        // A second save of the same URL must not overwrite: it gets a
+        // ` (1)` suffix.
+        let path2 =
+            download_to(&reqwest::Client::new(), &format!("{}/cats/cat-01.gif", server.uri()), &dir)
+                .await
+                .unwrap();
+        assert_eq!(path2, dir.join("cat-01 (1).gif"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gif_name_from_url_handles_weird_names() {
+        assert_eq!(gif_name_from_url("https://x/a/b.GIF?token=1"), "b.GIF");
+        assert_eq!(gif_name_from_url("https://x/a/b-c_2.mp4"), "b-c_2.mp4.gif");
+        assert_eq!(gif_name_from_url("https://x/a/b<d>?q"), "b_d_.gif");
+        assert_eq!(gif_name_from_url("https://x/"), "gifdeck.gif");
+        assert_eq!(gif_name_from_url("not a url"), "not a url.gif");
+    }
+
+    #[test]
+    fn download_dir_prefers_env_override() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        let prev = std::env::var_os("GIF_DOWNLOAD_PATH");
+        std::env::set_var("GIF_DOWNLOAD_PATH", "/some/download/dir");
+        assert_eq!(download_dir(), PathBuf::from("/some/download/dir"));
+        std::env::set_var("GIF_DOWNLOAD_PATH", "");
+        assert_ne!(download_dir(), PathBuf::from("/some/download/dir"));
+        match prev {
+            Some(v) => std::env::set_var("GIF_DOWNLOAD_PATH", v),
+            None => std::env::remove_var("GIF_DOWNLOAD_PATH"),
+        }
     }
 
     #[tokio::test]
