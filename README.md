@@ -54,8 +54,10 @@ brew install oneshinyboi/tap/gifdeck
 | `gifdeck-<ver>-x86_64-unknown-linux-musl.tar.gz`      | Linux x86_64 (static, any distro) |
 | `gifdeck-<ver>-aarch64-unknown-linux-gnu.tar.gz`      | Linux aarch64                   |
 | `gifdeck-<ver>-aarch64-apple-darwin.tar.gz`           | macOS Apple silicon             |
-| `gifdeck-<ver>-x86_64-apple-darwin.tar.gz`            | macOS Intel                     |
 | `gifdeck-<ver>-x86_64-pc-windows-msvc.zip`            | Windows x86_64                  |
+
+Intel Macs are not covered by prebuilt binaries — use
+`cargo install gifdeck` there instead.
 
 Verify a download against the release's `SHA256SUMS`:
 
