@@ -247,6 +247,19 @@ impl FavsClient {
     }
 }
 
+/// Server-ordering parity: `use_count` DESC, then `last_used` DESC
+/// (missing counts as lowest), tie-break `id` ASC — the same key the
+/// server's SQL uses, applied to the local store's view so both modes
+/// present identically.
+pub(crate) fn sort_by_use(items: &mut [FavItem]) {
+    items.sort_by(|a, b| {
+        b.use_count
+            .cmp(&a.use_count)
+            .then_with(|| b.last_used.cmp(&a.last_used))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 /// Where favorites live: the self-hosted server, or the local store.
 ///
 /// The two are alternatives, never a fallback for one another — the
@@ -300,7 +313,8 @@ impl FavsBackend {
         match self {
             FavsBackend::Server(client) => client.list_page(limit, offset).await,
             FavsBackend::Local(store) => {
-                let items = store.load()?;
+                let mut items = store.load()?;
+                sort_by_use(&mut items);
                 let total = items.len();
                 let page = items
                     .into_iter()
@@ -699,6 +713,56 @@ mod tests {
         assert_eq!(items[0].use_count, 2, "bumps persisted");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn local_backend_lists_pages_in_use_order() {
+        let (store, path) = local_store();
+        let backend = FavsBackend::Local(store.clone());
+        // Insert in a fixed file order: c, a, b.
+        for id in ["c1", "a1", "b1"] {
+            backend
+                .save(&GifResult {
+                    id: id.into(),
+                    ..test_gif()
+                })
+                .await
+                .unwrap();
+        }
+        // Use counts: b1 twice, c1 once, a1 never.
+        backend.increment_use("b1").await.unwrap();
+        backend.increment_use("b1").await.unwrap();
+        backend.increment_use("c1").await.unwrap();
+
+        let page = backend.list_page(0, 0).await.unwrap();
+        let ids: Vec<&str> = page.items.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["b1", "c1", "a1"], "use_count DESC");
+
+        // Tie-break: equal counts order by id ASC (a1, b1, c1 all unused).
+        // A separate file — `local_store()` has a single per-thread path.
+        let tie_path = path.with_extension("tie.json");
+        let _ = std::fs::remove_file(&tie_path);
+        let backend2 = FavsBackend::Local(LocalStore::at(&tie_path));
+        for id in ["c1", "a1", "b1"] {
+            backend2
+                .save(&GifResult {
+                    id: id.into(),
+                    ..test_gif()
+                })
+                .await
+                .unwrap();
+        }
+        let page = backend2.list_page(0, 0).await.unwrap();
+        let ids: Vec<&str> = page.items.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["a1", "b1", "c1"], "id ASC tie-break");
+
+        // Paging happens after sorting (offset 1 of the sorted view).
+        let page = backend.list_page(1, 1).await.unwrap();
+        assert_eq!(page.items[0].id, "c1");
+        assert_eq!(page.total, Some(3));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tie_path);
     }
 
     #[tokio::test]

@@ -175,9 +175,14 @@ Using a *favorited* GIF bumps its use stats on the active backend
 `last_used = now`; a persisted update in the local store). What counts
 as a use: picking (Enter/Space), copying the GIF file (`c`), and copying
 the URL (`y`). Non-favorites are ignored, and a failed bump surfaces in
-the footer without disturbing the pick/copy result. The server sorts its
-list by `use_count` (desc), so favorites you actually use float to the
-top of the Favorites tab.
+the footer without disturbing the pick/copy result.
+
+Both backends present the favorites list in the same order — `use_count`
+descending, then `last_used`, tie-broken by id (the server does it in
+SQL; gifdeck applies the same ordering to the local store's view, and
+`gifdeck favs` shows it too). On the Favorites tab the grid re-sorts
+after each bump and the cursor follows the bumped item to its new spot,
+so favorites you actually use float to the top right away.
 
 ## Configuration
 

@@ -805,12 +805,28 @@ impl App {
     /// bumps `use_count`/`last_used` on the active backend. Non-favorites
     /// are ignored and errors never crash the picker (they surface in the
     /// footer when there is one left to show — a pick quits immediately).
+    /// On the Favorites tab the grid re-sorts (the server and the local
+    /// view order by use count) and the cursor follows the bumped item to
+    /// its new position.
     async fn record_use(&mut self, id: &str) {
         if !self.fav_ids.contains(id) {
             return;
         }
-        if let Err(e) = self.favs.increment_use(id).await {
-            self.status = Some(format!("use bump failed: {e}"));
+        match self.favs.increment_use(id).await {
+            Ok(_) => {
+                if self.tab == Tab::Favorites {
+                    self.refresh_favorites_page().await;
+                    if let Some(pos) = self
+                        .favorites
+                        .items
+                        .iter()
+                        .position(|i| i.id == id)
+                    {
+                        self.favorites.selected = pos;
+                    }
+                }
+            }
+            Err(e) => self.status = Some(format!("use bump failed: {e}")),
         }
     }
 
@@ -1709,10 +1725,12 @@ mod tests {
 
         // 101 items = 3 pages; page 1 still has a successor, so the turn
         // proceeds and fetches: with a seeded store it returns a real page,
-        // proving the shortcut did not trigger.
+        // proving the shortcut did not trigger. Ids are zero-padded so the
+        // use-count sort's id-ASC tie-break orders them numerically (as
+        // the server's sort would too).
         let seeded: Vec<crate::favs::FavItem> = (0..101)
             .map(|i| crate::favs::FavItem {
-                id: format!("f{i}"),
+                id: format!("f{i:03}"),
                 url: format!("https://x/{i}.gif"),
                 preview: String::new(),
                 provider: "klipy".into(),
@@ -2138,6 +2156,44 @@ mod tests {
         let stored = LocalStore::at(&path).load().unwrap();
         assert_eq!(stored[0].use_count, 1);
         assert!(stored[0].last_used.is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn record_use_on_favorites_tab_resorts_and_follows_cursor() {
+        let path = local_store_path();
+        let backend = FavsBackend::Local(LocalStore::at(&path));
+        // Save a1, then b1. Equal counts → id ASC keeps [a1, b1].
+        let mut a1 = items(1)[0].clone();
+        a1.id = "a1".into();
+        let mut b1 = items(1)[0].clone();
+        b1.id = "b1".into();
+        let grid = vec![a1.clone(), b1.clone()];
+        backend.save(&a1.to_gif_result()).await.unwrap();
+        backend.save(&b1.to_gif_result()).await.unwrap();
+
+        let mut app = App::new(
+            Config::default(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            backend,
+        );
+        app.favorites.items = grid;
+        app.favorites.selected = 1;
+        app.tab = Tab::Favorites;
+        app.fav_ids = ["a1".to_string(), "b1".to_string()].into();
+
+        // Using b1 bumps it above a1; the grid re-sorts and the cursor
+        // follows b1 to position 0.
+        app.record_use("b1").await;
+        assert_eq!(app.favorites.items[0].id, "b1");
+        assert_eq!(app.favorites.items[1].id, "a1");
+        assert_eq!(app.favorites.selected, 0, "cursor follows the bump");
+
+        // The store itself was updated too.
+        let stored = LocalStore::at(&path).load().unwrap();
+        assert_eq!(stored.iter().find(|f| f.id == "b1").unwrap().use_count, 1);
+        assert!(stored.iter().find(|f| f.id == "b1").unwrap().last_used.is_some());
         let _ = std::fs::remove_file(&path);
     }
 
