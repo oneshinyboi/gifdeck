@@ -92,13 +92,21 @@ impl PreviewCache {
         self.lru.push_back(url.to_string());
     }
 
+    /// Evict least-recently-used entries while over the cap. In-flight
+    /// (`Requested`) entries are never evicted: the loader cannot be
+    /// cancelled, so dropping the bookkeeping would let the eventual result
+    /// re-insert and evict a visible entry (the load/unload thrash loop).
     fn evict(&mut self) {
         while self.map.len() > self.cap {
-            let Some(oldest) = self.lru.pop_front() else {
+            let Some(idx) = self
+                .lru
+                .iter()
+                .position(|u| !self.loading.contains(u))
+            else {
                 break;
             };
+            let oldest = self.lru.remove(idx).expect("index from iter() is valid");
             self.map.remove(&oldest);
-            self.loading.remove(&oldest);
         }
     }
 
@@ -113,8 +121,14 @@ impl PreviewCache {
         true
     }
 
+    /// Store a completed load. Results for URLs that are no longer tracked
+    /// as in-flight (evicted via `clear`, or a stale duplicate) are dropped
+    /// instead of re-inserted — a late insert would overshoot the cap and
+    /// evict a currently visible entry.
     pub fn insert_ready(&mut self, url: &str, cached: CachedPreview) {
-        self.loading.remove(url);
+        if !self.loading.remove(url) {
+            return;
+        }
         self.map
             .insert(url.to_string(), PreviewEntry::Ready(cached));
         self.touch(url);
@@ -122,7 +136,9 @@ impl PreviewCache {
     }
 
     pub fn insert_failed(&mut self, url: &str, why: String) {
-        self.loading.remove(url);
+        if !self.loading.remove(url) {
+            return;
+        }
         self.map.insert(url.to_string(), PreviewEntry::Failed(why));
         self.touch(url);
         self.evict();
@@ -326,15 +342,56 @@ mod tests {
     #[test]
     fn cache_insert_and_evict_at_cap() {
         let mut c = cache(3);
-        assert!(c.try_request("a"));
-        assert!(c.try_request("b"));
-        assert!(c.try_request("c"));
-        assert_eq!(c.len(), 3);
+        for k in ["a", "b", "c"] {
+            c.try_request(k);
+        }
+        // Complete the loads so entries become evictable.
+        for k in ["a", "b", "c"] {
+            c.insert_ready(k, empty_cached());
+        }
         assert!(c.try_request("d"));
         assert_eq!(c.len(), 3);
         assert!(c.get("a").is_none());
         assert!(c.get("b").is_some());
         assert!(c.get("d").is_some());
+    }
+
+    #[test]
+    fn evict_never_drops_in_flight_entries() {
+        let mut c = cache(2);
+        c.try_request("a");
+        c.try_request("b");
+        c.insert_ready("a", empty_cached());
+        // 'b' is still in flight: over cap it must not be evicted.
+        c.try_request("c");
+        assert!(c.get("b").is_some(), "in-flight entry kept");
+        assert!(c.get("a").is_none(), "lru ready entry evicted instead");
+        assert!(c.get("c").is_some());
+    }
+
+    #[test]
+    fn late_results_after_clear_are_dropped() {
+        let mut c = cache(4);
+        c.try_request("a");
+        c.clear();
+        c.insert_ready(
+            "a",
+            CachedPreview {
+                frames: Vec::new(),
+                delays: Vec::new(),
+                loaded_at: Instant::now(),
+            },
+        );
+        c.insert_failed("a", "boom".to_string());
+        assert!(c.get("a").is_none(), "stale result must not re-insert");
+    }
+
+    fn empty_cached() -> CachedPreview {
+        CachedPreview {
+            frames: Vec::new(),
+            delays: Vec::new(),
+            loaded_at: Instant::now(),
+        }
     }
 
     #[test]
@@ -355,10 +412,11 @@ mod tests {
                 loaded_at: Instant::now(),
             },
         );
+        c.insert_ready("b", empty_cached());
         assert!(c.try_request("c"));
         assert_eq!(c.len(), 2);
-        assert!(c.get("b").is_none(), "least-recently-used 'b' evicted");
-        assert!(c.get("a").is_some());
+        assert!(c.get("a").is_none(), "least-recently-used 'a' evicted");
+        assert!(c.get("b").is_some());
         assert!(c.get("c").is_some());
     }
 
@@ -382,6 +440,7 @@ mod tests {
         let mut c = cache(10);
         for k in ["a", "b", "c", "d", "e"] {
             c.try_request(k);
+            c.insert_ready(k, empty_cached());
         }
         c.set_cap(3);
         assert_eq!(c.len(), 3);
@@ -410,6 +469,7 @@ mod tests {
         assert!(!c.try_request("a"));
         c.insert_failed("a", "boom".to_string());
         assert!(!c.try_request("a"), "failed entries are not refetched");
+        c.try_request("b");
         c.insert_ready(
             "b",
             CachedPreview {

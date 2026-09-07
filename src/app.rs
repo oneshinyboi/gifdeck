@@ -970,8 +970,13 @@ impl App {
         self.ensure_visible();
 
         if let PreviewMode::Graphics { cache, .. } = &self.mode {
+            // Headroom (2×) so an overshoot never immediately evicts an
+            // on-screen entry (which would reload it, thrashing the counter).
             let visible = (self.cols as usize).saturating_mul(self.rows as usize);
-            cache.lock().unwrap().set_cap(visible);
+            cache
+                .lock()
+                .unwrap()
+                .set_cap(visible.saturating_mul(2).max(1));
         }
 
         let [tabs_area, search_area] = Layout::default()
