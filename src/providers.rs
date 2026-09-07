@@ -53,6 +53,26 @@ pub struct SearchPage {
     pub total: Option<usize>,
 }
 
+impl Provider {
+    /// Stable wire label used by the favorites server.
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::Giphy => "giphy",
+            Provider::Klipy => "klipy",
+        }
+    }
+
+    /// Parse the favorites server's provider label; unknown labels map to
+    /// Klipy (the primary backend in practice).
+    pub fn from_label(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("giphy") {
+            Provider::Giphy
+        } else {
+            Provider::Klipy
+        }
+    }
+}
+
 impl Source {
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         match s.to_ascii_lowercase().as_str() {

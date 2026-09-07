@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::providers::{GifResult, Provider};
+use crate::providers::GifResult;
 
 /// Timeout for every favorites HTTP request.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -115,7 +115,6 @@ impl FavsClient {
     }
 
     /// POST /favorites → upsert a favorite from a GifResult.
-    #[allow(dead_code)] // wired up in later sessions (TUI c/v actions)
     pub async fn save(&self, gif: &GifResult) -> anyhow::Result<FavItem> {
         #[derive(Serialize)]
         struct SaveBody<'a> {
@@ -125,15 +124,11 @@ impl FavsClient {
             provider: &'a str,
             title: &'a str,
         }
-        let provider = match gif.provider {
-            Provider::Giphy => "giphy",
-            Provider::Klipy => "klipy",
-        };
         let body = SaveBody {
             id: &gif.id,
             url: &gif.url,
             preview: &gif.preview_url,
-            provider,
+            provider: gif.provider.label(),
             title: &gif.title,
         };
         let resp = self
@@ -154,7 +149,7 @@ impl FavsClient {
     }
 
     /// PATCH /favorites/{id}/use → increment usage.
-    #[allow(dead_code)] // wired up in later sessions (TUI c/v actions)
+    #[allow(dead_code)] // wired up in later sessions (use-tracking on pick)
     pub async fn increment_use(&self, id: &str) -> anyhow::Result<UseCount> {
         let path = urlenc(id);
         let resp = self
@@ -176,7 +171,6 @@ impl FavsClient {
     }
 
     /// DELETE /favorites/{id} → remove favorite.
-    #[allow(dead_code)] // wired up in later sessions (TUI c/v actions)
     pub async fn delete(&self, id: &str) -> anyhow::Result<()> {
         let path = urlenc(id);
         let resp = self
@@ -209,7 +203,6 @@ impl FavsClient {
     }
 }
 
-#[allow(dead_code)] // used by increment_use/delete, wired up later
 fn urlenc(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -226,6 +219,7 @@ fn urlenc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::Provider;
     use serde_json::json;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
