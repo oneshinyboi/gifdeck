@@ -18,16 +18,18 @@ use crate::cli::{Cli, Command};
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Search {
+        // Bare `gifdeck` (no subcommand) opens the picker.
+        None => cmd_tui(None, false).await,
+        Some(Command::Search {
             query,
             source,
             max,
             json,
-        } => cmd_search(query, source, max, json).await,
-        Command::Favs { json, export, import } => {
+        }) => cmd_search(query, source, max, json).await,
+        Some(Command::Favs { json, export, import }) => {
             cmd_favs(json, export, import).await
         }
-        Command::Tui { query, favs } => cmd_tui(query, favs).await,
+        Some(Command::Tui { query, favs }) => cmd_tui(query, favs).await,
     }
 }
 

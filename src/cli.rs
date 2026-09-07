@@ -7,8 +7,9 @@ use clap::{Parser, Subcommand};
     about = "A GIF picker backed by GIPHY/KLIPY"
 )]
 pub struct Cli {
+    /// No subcommand (bare `gifdeck`) launches the TUI picker.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]

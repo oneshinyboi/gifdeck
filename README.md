@@ -1,33 +1,12 @@
 # gifdeck
 
 A standalone Rust + ratatui GIF picker for the command line. It searches
-GIPHY and KLIPY, manages a favorites list synced through a self-hosted server and feeds chosen GIFs into the Concord Discord TUI
-client via Ctrl+V paste.
-
-## Status
-
-Session 5 (local favorites + gifdeck-owned config/state). Implemented:
-CLI, config, GIPHY/KLIPY search providers, and a single tabbed picker —
-an interactive Search box plus a Favorites tab sharing one animated GIF
-grid with inline previews on Kitty/Ghostty-style terminals (Kitty
-graphics protocol) and a title-only fallback elsewhere. `v`
-favorites/unfavorites against the configured backend, `c` copies the GIF
-file itself to the clipboard as `image/gif` (real attachment on paste),
-`y` copies the URL. Favorites live either on the self-hosted server or in
-a local JSON store — whichever is configured, exclusively.
-
-Not yet implemented (next session): public readiness.
-
-## TODO
-
-1. **Local-mode TUI verification** — the interactive Favorites-tab `v`
-   flow (Tab → Favorites, toggle against the local store) has only been
-   verified via unit tests (`toggle_local_backend_*`), not driven in a
-   live terminal session.
+GIPHY and KLIPY, manages a favorites list synced to local storage/self-hosted server.
 
 ## Usage
 
 ```
+gifdeck                     # shorthand for `gifdeck tui`
 gifdeck search <query> [--source auto|giphy|klipy] [--max N] [--json]
 gifdeck favs [--json] [--export] [--import]
 gifdeck tui [<query>] [--favs]
@@ -53,6 +32,9 @@ gifdeck favs --import
 
 # Unified picker: type a query, Enter to search, Tab to switch tabs
 gifdeck tui
+
+# Bare — same as `gifdeck tui`
+gifdeck
 
 # Same, but with the search pre-run for "cat"
 gifdeck tui cat
