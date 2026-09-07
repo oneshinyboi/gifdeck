@@ -62,6 +62,7 @@ struct KlipyResult {
 #[derive(Debug, Deserialize, Clone)]
 struct KlipyMediaFormats {
     gif: Option<KlipyMedia>,
+    tinygif: Option<KlipyMedia>,
     preview: Option<KlipyMedia>,
 }
 
@@ -116,8 +117,9 @@ impl KlipyResult {
             url: self.media_formats.gif.and_then(|m| m.url).unwrap_or_default(),
             preview_url: self
                 .media_formats
-                .preview
+                .tinygif
                 .and_then(|m| m.url)
+                .or_else(|| self.media_formats.preview.and_then(|m| m.url))
                 .unwrap_or_default(),
             provider: Provider::Klipy,
         }
@@ -243,6 +245,49 @@ mod tests {
         assert_eq!(Source::parse("klipy").unwrap(), Source::Klipy);
         assert_eq!(Source::parse("tenor").unwrap(), Source::Klipy);
         assert!(Source::parse("bing").is_err());
+    }
+
+    #[test]
+    fn klipy_preview_prefers_animated_tinygif() {
+        let json = r#"
+        {
+          "results": [
+            {
+              "id": "k4",
+              "content_description": "tiny animated cat",
+              "tags": [],
+              "media_formats": {
+                "gif": { "url": "https://static.klipy.com/gifs/k4.gif" },
+                "tinygif": { "url": "https://static.klipy.com/tiny/k4.gif" },
+                "preview": { "url": "https://static.klipy.com/previews/k4.jpg" }
+              }
+            }
+          ]
+        }"#;
+        let parsed: KlipyResponse = serde_json::from_str(json).unwrap();
+        let gif = parsed.results[0].clone().into_gif();
+        assert_eq!(gif.preview_url, "https://static.klipy.com/tiny/k4.gif");
+    }
+
+    #[test]
+    fn klipy_preview_falls_back_to_preview_media() {
+        let json = r#"
+        {
+          "results": [
+            {
+              "id": "k5",
+              "content_description": "no tinygif",
+              "tags": [],
+              "media_formats": {
+                "gif": { "url": "https://static.klipy.com/gifs/k5.gif" },
+                "preview": { "url": "https://static.klipy.com/previews/k5.jpg" }
+              }
+            }
+          ]
+        }"#;
+        let parsed: KlipyResponse = serde_json::from_str(json).unwrap();
+        let gif = parsed.results[0].clone().into_gif();
+        assert_eq!(gif.preview_url, "https://static.klipy.com/previews/k5.jpg");
     }
 
     #[test]
