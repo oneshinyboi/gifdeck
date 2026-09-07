@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 use ratatui_image::picker::{Picker, ProtocolType};
+use tokio::sync::mpsc;
 
 use crate::clipboard;
 use crate::config::Config;
@@ -144,6 +145,17 @@ pub enum Pending {
 pub enum PageDir {
     Next,
     Prev,
+}
+
+/// Result of a background clipboard/download job, delivered back to the
+/// event loop (which updates the footer and use-tracking).
+enum JobResult {
+    /// `c`: GIF downloaded and placed on the clipboard.
+    CopiedGif { id: String, result: anyhow::Result<()> },
+    /// `D`: GIF saved to a directory.
+    SavedGif { id: String, result: anyhow::Result<std::path::PathBuf> },
+    /// `y`: URL copied as text.
+    CopiedUrl { id: String, result: anyhow::Result<()> },
 }
 
 /// Outcome of a page-turn attempt.
@@ -453,6 +465,10 @@ pub struct App {
     pub status: Option<String>,
     /// Action requested via keypress, executed by the event loop.
     pub pending: Option<Pending>,
+    /// Background clipboard/download jobs: `job_rx` receives results
+    /// spawned via `job_tx` and drained by the event loop.
+    job_tx: mpsc::UnboundedSender<JobResult>,
+    job_rx: mpsc::UnboundedReceiver<JobResult>,
 }
 
 impl App {
@@ -462,6 +478,7 @@ impl App {
         source: providers::Source,
         favs: FavsBackend,
     ) -> Self {
+        let (job_tx, job_rx) = mpsc::unbounded_channel();
         App {
             tab: Tab::Search,
             search: GridState::default(),
@@ -480,6 +497,8 @@ impl App {
             mode: PreviewMode::Fallback,
             status: None,
             pending: None,
+            job_tx,
+            job_rx,
         }
     }
 
@@ -771,57 +790,102 @@ impl App {
         }
     }
 
-    /// Download the selected GIF and put its bytes on the clipboard as
-    /// image/gif.
-    async fn copy_gif(&mut self) {
+    /// Queue a background job that downloads the selected GIF and puts
+    /// its bytes on the clipboard as image/gif. The result comes back
+    /// through `job_rx` (see `apply_job_result`).
+    fn spawn_copy_gif(&mut self) {
         let Some(item) = self.active_item().cloned() else {
             return;
         };
-        match clipboard::copy_gif_file(&self.http, &item.url).await {
-            Ok(()) => {
-                self.status = Some("copied GIF to clipboard".into());
-                self.record_use(&item.id).await;
-            }
-            Err(e) => self.status = Some(format!("copy failed: {e}")),
-        }
+        self.status = Some("copying gif…".into());
+        let http = self.http.clone();
+        let (url, id) = (item.url.clone(), item.id.clone());
+        let tx = self.job_tx.clone();
+        tokio::spawn(async move {
+            let result = clipboard::copy_gif_file(&http, &url).await;
+            let _ = tx.send(JobResult::CopiedGif { id, result });
+        });
+    }
+
+    /// Queue a background job that saves the selected GIF to `dir`.
+    fn spawn_download_gif_to(&mut self, dir: &std::path::Path) {
+        let Some(item) = self.active_item().cloned() else {
+            return;
+        };
+        self.status = Some("downloading gif…".into());
+        let http = self.http.clone();
+        let (url, id) = (item.url.clone(), item.id.clone());
+        let dir = dir.to_path_buf();
+        let tx = self.job_tx.clone();
+        tokio::spawn(async move {
+            let result = clipboard::download_to(&http, &url, &dir).await;
+            let _ = tx.send(JobResult::SavedGif { id, result });
+        });
     }
 
     /// Save the selected GIF to the download folder
     /// (`$GIF_DOWNLOAD_PATH`, else the user's downloads directory).
-    async fn download_gif(&mut self) {
+    fn spawn_download_gif(&mut self) {
         let dir = clipboard::download_dir();
-        self.download_gif_to(&dir).await;
+        self.spawn_download_gif_to(&dir);
     }
 
-    /// Save the selected GIF to an explicit directory.
-    async fn download_gif_to(&mut self, dir: &std::path::Path) {
+    /// Queue a background job that copies the selected GIF's URL as
+    /// text. The clipboard subprocess is blocking, so it runs on the
+    /// blocking thread pool.
+    fn spawn_copy_url(&mut self) {
         let Some(item) = self.active_item().cloned() else {
             return;
         };
-        match clipboard::download_to(&self.http, &item.url, dir).await {
-            Ok(path) => {
-                self.status = Some(format!("saved to {}", path.display()));
-                self.record_use(&item.id).await;
-            }
-            Err(e) => self.status = Some(format!("download failed: {e}")),
+        self.status = Some("copying url…".into());
+        let (url, id) = (item.url.clone(), item.id.clone());
+        let tx = self.job_tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || clipboard::copy_text(&url))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("copy task failed: {e}")));
+            let _ = tx.send(JobResult::CopiedUrl { id, result });
+        });
+    }
+
+    /// Drain completed background jobs and surface their outcomes:
+    /// footer status plus a use bump on success. Returns whether any
+    /// job finished (so the caller knows to redraw).
+    async fn apply_job_result(&mut self, res: JobResult) {
+        match res {
+            JobResult::CopiedGif { id, result } => match result {
+                Ok(()) => {
+                    self.status = Some("copied GIF to clipboard".into());
+                    self.record_use(&id).await;
+                }
+                Err(e) => self.status = Some(format!("copy failed: {e}")),
+            },
+            JobResult::SavedGif { id, result } => match result {
+                Ok(path) => {
+                    self.status = Some(format!("saved to {}", path.display()));
+                    self.record_use(&id).await;
+                }
+                Err(e) => self.status = Some(format!("download failed: {e}")),
+            },
+            JobResult::CopiedUrl { id, result } => match result {
+                Ok(()) => {
+                    self.status = Some("copied URL".into());
+                    self.record_use(&id).await;
+                }
+                Err(e) => self.status = Some(format!("copy failed: {e}")),
+            },
         }
     }
 
-    /// Copy the selected GIF's URL as text. Returns whether the copy succeeded.
-    fn copy_url(&mut self) -> bool {
-        let Some(item) = self.active_item().cloned() else {
-            return false;
-        };
-        match clipboard::copy_text(&item.url) {
-            Ok(()) => {
-                self.status = Some("copied URL".into());
-                true
-            }
-            Err(e) => {
-                self.status = Some(format!("copy failed: {e}"));
-                false
-            }
+    /// Take every finished background job and apply it. Returns how
+    /// many results were applied.
+    pub async fn drain_jobs(&mut self) -> usize {
+        let mut applied = 0;
+        while let Ok(res) = self.job_rx.try_recv() {
+            self.apply_job_result(res).await;
+            applied += 1;
         }
+        applied
     }
 
     /// Count a "use" of a favorited GIF (pick, copied GIF, copied URL):
@@ -1326,22 +1390,13 @@ pub async fn run(mut app: App) -> Result<Option<String>> {
                     app.toggle_favorite().await;
                 }
                 Some(Pending::CopyGif) => {
-                    app.status = Some("copying gif…".into());
-                    terminal.draw(|f| app.draw(f))?;
-                    app.copy_gif().await;
+                    app.spawn_copy_gif();
                 }
                 Some(Pending::Download) => {
-                    app.status = Some("downloading gif…".into());
-                    terminal.draw(|f| app.draw(f))?;
-                    app.download_gif().await;
+                    app.spawn_download_gif();
                 }
                 Some(Pending::CopyUrl) => {
-                    if app.copy_url() {
-                        let id = app.active_item().map(|i| i.id.clone());
-                        if let Some(id) = id {
-                            app.record_use(&id).await;
-                        }
-                    }
+                    app.spawn_copy_url();
                 }
                 Some(Pending::Use(id)) => {
                     app.record_use(&id).await;
@@ -1351,6 +1406,9 @@ pub async fn run(mut app: App) -> Result<Option<String>> {
                 }
                 None => {}
             }
+            // Surface finished background jobs (clipboard copies,
+            // downloads) between event polls.
+            app.drain_jobs().await;
             terminal.draw(|f| app.draw(f))?;
             if event::poll(tick)? {
                 if let Event::Key(key) = event::read()? {
@@ -2235,6 +2293,17 @@ mod tests {
         assert_eq!(app.pending, Some(Pending::Download));
     }
 
+    /// Wait for the app's background jobs to finish and apply them.
+    async fn wait_for_jobs(app: &mut App) {
+        for _ in 0..200 {
+            if app.drain_jobs().await > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("background job did not finish in time");
+    }
+
     #[tokio::test]
     async fn download_saves_to_dir_and_bumps_favorite_use() {
         let server = wiremock::MockServer::start().await;
@@ -2267,7 +2336,11 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        app.download_gif_to(&dir).await;
+        app.spawn_download_gif_to(&dir);
+        assert_eq!(app.status.as_deref(), Some("downloading gif…"));
+
+        // The job runs in the background; draining applies the result.
+        wait_for_jobs(&mut app).await;
 
         let saved = dir.join("0.gif");
         assert!(saved.exists());
@@ -2284,6 +2357,63 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn download_failure_surfaces_in_footer_after_drain() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/0.gif"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let mut app = test_app(items(1));
+        app.search.items[0].url = format!("{}/0.gif", server.uri());
+
+        let dir = std::env::temp_dir().join(format!(
+            "gifdeck-app-dl-fail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.spawn_download_gif_to(&dir);
+        wait_for_jobs(&mut app).await;
+
+        assert!(
+            app.status.as_deref().unwrap().contains("download failed"),
+            "got: {:?}",
+            app.status
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_url_job_completes_in_background() {
+        let mut app = test_app(items(3));
+        app.spawn_copy_url();
+        assert_eq!(app.status.as_deref(), Some("copying url…"));
+
+        // Whether the copy itself succeeds depends on the environment
+        // (wl-copy/xclip); the job must complete either way.
+        wait_for_jobs(&mut app).await;
+        let status = app.status.as_deref().unwrap();
+        assert!(
+            status.starts_with("copied URL") || status.starts_with("copy failed"),
+            "got: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_job_with_no_active_item_is_a_noop() {
+        let mut app = test_app(vec![]);
+        app.status = None;
+        app.spawn_copy_gif();
+        app.spawn_copy_url();
+        app.spawn_download_gif();
+        assert_eq!(app.status, None);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(app.drain_jobs().await, 0);
     }
 
     #[tokio::test]

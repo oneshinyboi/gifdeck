@@ -232,10 +232,13 @@ pub fn place_gif_on_clipboard(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Download the GIF at `url` and put its bytes on the clipboard as
-/// `image/gif`.
+/// `image/gif`. The blocking clipboard subprocess runs on the blocking
+/// thread pool so async callers stay responsive.
 pub async fn copy_gif_file(http: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     let path = download_gif(http, url).await?;
-    place_gif_on_clipboard(&path)
+    tokio::task::spawn_blocking(move || place_gif_on_clipboard(&path))
+        .await
+        .map_err(|e| anyhow::anyhow!("clipboard task failed: {e}"))?
 }
 
 /// Fresh temp file path under `<cache>/gifdeck/`.
