@@ -91,17 +91,17 @@ async fn cmd_favs(json: bool, export: bool, import: bool) -> anyhow::Result<()> 
             return Ok(());
         }
         let total = items.len();
-        let mut ok = 0usize;
-        let mut last_err = None;
-        for item in &items {
-            match client.save(&item.to_gif_result()).await {
-                Ok(_) => ok += 1,
-                Err(e) => last_err = Some(e),
-            }
-        }
+        let (ok, failures) = favs::import_to_server(client, &items).await;
         println!("imported {ok}/{total} local favorites to the server");
-        if let Some(e) = last_err {
-            eprintln!("gifdeck: warning: some favorites failed to import: {e}");
+        if !failures.is_empty() {
+            eprintln!("gifdeck: failed to import {} favorites:", failures.len());
+            for (id, e) in &failures {
+                eprintln!("  {id}: {e:#}");
+            }
+            anyhow::bail!(
+                "{ok}/{total} favorites imported; {} failed (see details above)",
+                failures.len()
+            );
         }
         return Ok(());
     }

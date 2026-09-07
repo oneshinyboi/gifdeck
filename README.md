@@ -24,9 +24,6 @@ Not yet implemented (next session): public readiness.
    flow (Tab → Favorites, toggle against the local store) has only been
    verified via unit tests (`toggle_local_backend_*`), not driven in a
    live terminal session.
-2. **`favs --import` failure detail** — import currently reports only a
-   summary count ("imported N/M"); it should say which favorites failed
-   and why.
 
 ## Usage
 
@@ -88,7 +85,9 @@ only crossover between the two stores is explicit:
 - `gifdeck favs --export` — server → local store (overwrites the local
   file with the server's list)
 - `gifdeck favs --import` — local store → server (upserts each entry by
-  id; idempotent)
+  id; idempotent). Every favorite is attempted even after a failure;
+  failed ones are listed per id with the reason, and the command exits
+  non-zero when any failed.
 
 So switching modes is a two-step choice: transfer with `--export`/`--import`,
 then either set `"FAVORITES_MODE": "local"` in the config (keeping the

@@ -376,6 +376,26 @@ fn urlenc(s: &str) -> String {
     out
 }
 
+/// Push a list of favorites onto the server, upserting each by id (the
+/// `favs --import` engine). Tolerant by design: every item is attempted
+/// even after failures, and the outcome is reported in full — the
+/// imported count plus one (id, error) pair per failed favorite, in
+/// input order.
+pub async fn import_to_server(
+    client: &FavsClient,
+    items: &[FavItem],
+) -> (usize, Vec<(String, anyhow::Error)>) {
+    let mut ok = 0usize;
+    let mut failures = Vec::new();
+    for item in items {
+        match client.save(&item.to_gif_result()).await {
+            Ok(_) => ok += 1,
+            Err(e) => failures.push((item.id.clone(), e)),
+        }
+    }
+    (ok, failures)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +708,59 @@ mod tests {
         assert!(items.iter().all(|f| f.id != "b1"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn import_to_server_reports_every_failure() {
+        let server = MockServer::start().await;
+        // "ok1" upserts fine; anything else gets a 502. The specific mock
+        // wins by priority (lower number = higher precedence).
+        Mock::given(method("POST"))
+            .and(path("/favorites"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "id": "ok1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "ok1", "url": "", "preview": "", "provider": "klipy",
+                "title": ""
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/favorites"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_json(json!({"error": "upstream down"})),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let fav = |id: &str| FavItem {
+            id: id.into(),
+            url: format!("https://x/{id}.gif"),
+            preview: String::new(),
+            provider: "klipy".into(),
+            title: String::new(),
+            use_count: 0,
+            added_at: None,
+            last_used: None,
+        };
+        let client = client_for(&server.uri());
+
+        let (ok, failures) =
+            import_to_server(&client, &[fav("bad1"), fav("ok1"), fav("bad2")]).await;
+        assert_eq!(ok, 1);
+        assert_eq!(failures.len(), 2, "every failure is reported");
+        assert_eq!(failures[0].0, "bad1", "failures keep input order");
+        assert_eq!(failures[1].0, "bad2");
+        let msg = failures[0].1.to_string();
+        assert!(msg.contains("502"), "got: {msg}");
+        assert!(msg.contains("upstream down"), "got: {msg}");
+
+        // An empty import list trivially succeeds.
+        let (ok, failures) = import_to_server(&client, &[]).await;
+        assert_eq!((ok, failures.len()), (0, 0));
     }
 
     #[tokio::test]

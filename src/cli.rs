@@ -1,38 +1,10 @@
 use clap::{Parser, Subcommand};
 
-/// Search engine help text documenting config resolution.
-pub const CONFIG_HELP: &str = "\
-CONFIGURATION
-
-Configuration is read once per process from the gifdeck config file:
-    <dirs::config_dir()>/gifdeck/config.json
-(overridable with the GIFDECK_CONFIG environment variable pointing at an
-alternate file).
-
-Keys:
-    KLIPY_API_KEY              KLIPY search API key
-    GIPHY_API_KEY              GIPHY search API key
-    GIFDECK_FAVORITES_API      favorites server base URL (server mode)
-    GIFDECK_FAVORITES_TOKEN    favorites server auth token
-
-Favorites storage is exclusive: with a token configured, favorites live on
-the server; without one, they live in the local store at
-<dirs::data_dir()>/gifdeck/favorites.json. The two never mix; the only
-crossover is explicit: `gifdeck favs --export` copies the server's list
-into the local store, `gifdeck favs --import` pushes the local store onto
-the server (both require a configured server).
-
-Precedence: a non-empty environment variable of the same name wins over
-the file value, which wins over an unset value. A missing file is fine
-(empty config); invalid JSON is warned about on stderr and treated as
-empty config. Unknown JSON keys are ignored. Values are never logged.";
-
 #[derive(Debug, Parser)]
 #[command(
     name = "gifdeck",
     version,
-    about = "A GIF picker backed by GIPHY/KLIPY and a self-hosted favorites server",
-    after_help = CONFIG_HELP
+    about = "A GIF picker backed by GIPHY/KLIPY"
 )]
 pub struct Cli {
     #[command(subcommand)]
