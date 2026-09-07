@@ -19,7 +19,7 @@ use ratatui_image::picker::{Picker, ProtocolType};
 
 use crate::clipboard;
 use crate::config::Config;
-use crate::favs::{FavsClient, FavItem};
+use crate::favs::{FavItem, FavsBackend};
 use crate::preview::{self, PreviewCache, PreviewLoader, MAX_CACHE_CAP, PREVIEW_SIZE};
 use crate::providers::{self, GifResult, Provider};
 
@@ -170,8 +170,9 @@ pub enum Pager {
         total: Option<usize>,
     },
     Favs {
-        client: FavsClient,
-        /// Total favorites, from the server's `X-Total-Count`.
+        backend: FavsBackend,
+        /// Total favorites, from the server's `X-Total-Count` (or the
+        /// local store's length).
         total: Option<usize>,
     },
 }
@@ -213,10 +214,11 @@ impl Pager {
         }
     }
 
-    /// Pager for the self-hosted favorites server (offset-based). `total`
-    /// comes from the initial fetch's `X-Total-Count` header.
-    pub fn favs(client: FavsClient, total: Option<usize>) -> Self {
-        Pager::Favs { client, total }
+    /// Pager for favorites (offset-based): the self-hosted server or the
+    /// local store, behind the same backend. `total` comes from the
+    /// initial fetch (`X-Total-Count` / store length).
+    pub fn favs(backend: FavsBackend, total: Option<usize>) -> Self {
+        Pager::Favs { backend, total }
     }
 
     /// Total items across all pages, when the source reports it.
@@ -287,7 +289,7 @@ impl Pager {
                 *total = fetched_total.or(*total);
                 Ok(PageTurn::Page(items))
             }
-            Pager::Favs { client, total } => {
+            Pager::Favs { backend, total } => {
                 let target = match dir {
                     PageDir::Next => {
                         if let Some(t) = *total {
@@ -304,7 +306,7 @@ impl Pager {
                         page - 1
                     }
                 };
-                let fetched = client.list_page(PAGE_SIZE, target * PAGE_SIZE).await?;
+                let fetched = backend.list_page(PAGE_SIZE, target * PAGE_SIZE).await?;
                 *total = fetched.total.or(*total);
                 if fetched.items.is_empty() {
                     return Ok(PageTurn::AtLast);
@@ -430,10 +432,10 @@ pub struct App {
     /// Whether typing goes into the search box instead of the keymap.
     /// Only ever true on the Search tab.
     pub search_focused: bool,
-    /// IDs of the favorites on the server (drives ★/☆ and v toggling).
+    /// IDs of the current favorites (drives ★/☆ and v toggling).
     pub fav_ids: HashSet<String>,
-    /// Client for the favorites server, when configured.
-    pub favs_client: Option<FavsClient>,
+    /// Where favorites live: the self-hosted server, or the local store.
+    pub favs: FavsBackend,
     http: reqwest::Client,
     cfg: Config,
     source: providers::Source,
@@ -449,7 +451,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config, http: reqwest::Client, source: providers::Source) -> Self {
+    pub fn new(
+        cfg: Config,
+        http: reqwest::Client,
+        source: providers::Source,
+        favs: FavsBackend,
+    ) -> Self {
         App {
             tab: Tab::Search,
             search: GridState::default(),
@@ -457,7 +464,7 @@ impl App {
             query: String::new(),
             search_focused: false,
             fav_ids: HashSet::new(),
-            favs_client: None,
+            favs,
             http,
             cfg,
             source,
@@ -478,10 +485,6 @@ impl App {
 
     pub fn set_query(&mut self, q: impl Into<String>) {
         self.query = q.into();
-    }
-
-    pub fn set_favs_client(&mut self, client: Option<FavsClient>) {
-        self.favs_client = client;
     }
 
     pub fn set_fav_ids(&mut self, ids: HashSet<String>) {
@@ -689,16 +692,14 @@ impl App {
     }
 
     /// Toggle the favorite state of the selected item against the
-    /// server: delete when already favorited, save otherwise. The footer
-    /// reports the outcome; server errors never crash the picker.
+    /// configured backend (server or local store): delete when already
+    /// favorited, save otherwise. The footer reports the outcome; errors
+    /// never crash the picker.
     async fn toggle_favorite(&mut self) {
         let Some(item) = self.active_item().cloned() else {
             return;
         };
-        let Some(favs) = self.favs_client.clone() else {
-            self.status = Some("favorites not configured (GIFGREP_FAVORITES_TOKEN)".into());
-            return;
-        };
+        let favs = self.favs.clone();
         let was_fav = self.fav_ids.contains(&item.id);
         let result = if was_fav {
             favs.delete(&item.id).await
@@ -707,12 +708,21 @@ impl App {
         };
         match result {
             Ok(()) => {
+                let local = self.favs.is_local();
                 if was_fav {
                     self.fav_ids.remove(&item.id);
-                    self.status = Some("☆ removed from favorites".into());
+                    self.status = Some(if local {
+                        "☆ removed from local favorites".into()
+                    } else {
+                        "☆ removed from favorites".into()
+                    });
                 } else {
                     self.fav_ids.insert(item.id.clone());
-                    self.status = Some("★ saved to favorites".into());
+                    self.status = Some(if local {
+                        "★ saved to local favorites".into()
+                    } else {
+                        "★ saved to favorites".into()
+                    });
                 }
                 if self.tab == Tab::Favorites {
                     self.refresh_favorites_page().await;
@@ -726,9 +736,7 @@ impl App {
     /// in sync after a toggle; keeps the cursor when possible and steps
     /// back a page when the current one emptied out.
     async fn refresh_favorites_page(&mut self) {
-        let Some(favs) = self.favs_client.clone() else {
-            return;
-        };
+        let favs = self.favs.clone();
         let mut page = self.favorites.page;
         let fetched = loop {
             match favs.list_page(PAGE_SIZE, page * PAGE_SIZE).await {
@@ -781,28 +789,27 @@ impl App {
     /// After a tab switch: refresh the favorite-ID set (star markers) and
     /// load the favorites page if the tab has never been populated.
     async fn load_tab(&mut self) {
-        if let Some(favs) = self.favs_client.clone() {
-            match favs.list().await {
-                Ok(items) => {
-                    self.fav_ids = items.into_iter().map(|f| f.id).collect();
-                }
-                Err(e) => self.status = Some(format!("favorites unavailable: {e}")),
+        let favs = self.favs.clone();
+        match favs.list().await {
+            Ok(items) => {
+                self.fav_ids = items.into_iter().map(|f| f.id).collect();
             }
-            if self.tab == Tab::Favorites && self.favorites.pager.is_none() {
-                match favs.list_page(PAGE_SIZE, 0).await {
-                    Ok(p) => {
-                        let empty = p.items.is_empty();
-                        let total = p.total;
-                        let items: Vec<UrlItem> = p.items.into_iter().map(UrlItem::from).collect();
-                        self.favorites.pager = Some(Pager::favs(favs, total));
-                        self.favorites.page = 0;
-                        self.apply_page(items);
-                        if empty {
-                            self.status = None;
-                        }
+            Err(e) => self.status = Some(format!("favorites unavailable: {e}")),
+        }
+        if self.tab == Tab::Favorites && self.favorites.pager.is_none() {
+            match favs.list_page(PAGE_SIZE, 0).await {
+                Ok(p) => {
+                    let empty = p.items.is_empty();
+                    let total = p.total;
+                    let items: Vec<UrlItem> = p.items.into_iter().map(UrlItem::from).collect();
+                    self.favorites.pager = Some(Pager::favs(favs, total));
+                    self.favorites.page = 0;
+                    self.apply_page(items);
+                    if empty {
+                        self.status = None;
                     }
-                    Err(e) => self.status = Some(format!("favorites load failed: {e}")),
                 }
+                Err(e) => self.status = Some(format!("favorites load failed: {e}")),
             }
         }
         self.clear_previews();
@@ -1022,7 +1029,13 @@ impl App {
             .as_deref()
             .map(|s| format!(" — {s}"))
             .unwrap_or_default();
-        let action_line = format!("Tab switch · c copy gif · y copy url · v favorite{status_note}");
+        let mode_note = if self.favs.is_local() {
+            " · local favorites"
+        } else {
+            ""
+        };
+        let action_line =
+            format!("Tab switch · c copy gif · y copy url · v favorite{mode_note}{status_note}");
 
         let [footer_nav, footer_actions] = Layout::default()
             .direction(Direction::Vertical)
@@ -1270,7 +1283,10 @@ pub async fn run(mut app: App) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::favs::FavsClient;
+    use crate::store::LocalStore;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use std::path::PathBuf;
 
     fn items(n: usize) -> Vec<UrlItem> {
         (0..n)
@@ -1285,13 +1301,28 @@ mod tests {
     }
 
     fn test_app(items: Vec<UrlItem>) -> App {
+        // A local backend pointed at a per-test temp path; tests that
+        // don't toggle never touch it, and toggle tests build their own.
         let mut app = App::new(
             Config::default(),
             reqwest::Client::new(),
             providers::Source::Auto,
+            FavsBackend::Local(LocalStore::at(local_store_path())),
         );
         app.search.items = items;
         app
+    }
+
+    fn local_store_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "gifdeck-app-test-store-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
+    fn server_backend(cfg: &Config) -> FavsBackend {
+        FavsBackend::Server(FavsClient::new(cfg).unwrap())
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1588,6 +1619,90 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn pager_next_without_cursor_reports_last_page() {
+        let mut pager = search_pager(None, None);
+        assert!(matches!(
+            pager.turn(PageDir::Next, 0).await,
+            Ok(PageTurn::AtLast)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pager_prev_at_first_page_is_refused() {
+        let mut pager = search_pager(
+            Some(providers::PageCursor::Klipy {
+                pos: "abc".to_string(),
+            }),
+            None,
+        );
+        assert!(matches!(
+            pager.turn(PageDir::Prev, 0).await,
+            Ok(PageTurn::AtFirst)
+        ));
+
+        // Local backend on page 0: refused before touching the store.
+        let mut pager = Pager::favs(FavsBackend::Local(LocalStore::at(local_store_path())), None);
+        assert!(matches!(
+            pager.turn(PageDir::Prev, 0).await,
+            Ok(PageTurn::AtFirst)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pager_next_past_known_total_is_refused_offline() {
+        // 100 items = 2 pages; on page 1 (0-based) a Next turn must not
+        // hit the backing store at all — the path points at a file that
+        // does not exist, proving the refusal was local.
+        let store = LocalStore::at(std::env::temp_dir().join(format!(
+            "gifdeck-pager-refusal-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        let mut pager = Pager::favs(FavsBackend::Local(store), Some(100));
+        assert!(matches!(
+            pager.turn(PageDir::Next, 1).await,
+            Ok(PageTurn::AtLast)
+        ));
+
+        // 101 items = 3 pages; page 1 still has a successor, so the turn
+        // proceeds and fetches: with a seeded store it returns a real page,
+        // proving the shortcut did not trigger.
+        let seeded: Vec<crate::favs::FavItem> = (0..101)
+            .map(|i| crate::favs::FavItem {
+                id: format!("f{i}"),
+                url: format!("https://x/{i}.gif"),
+                preview: String::new(),
+                provider: "klipy".into(),
+                title: String::new(),
+                use_count: 0,
+                added_at: None,
+                last_used: None,
+            })
+            .collect();
+        let store = LocalStore::at(std::env::temp_dir().join(format!(
+            "gifdeck-pager-refusal-{}-{:?}-b.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        store.save_all(&seeded).unwrap();
+        let mut pager = Pager::favs(FavsBackend::Local(store.clone()), Some(101));
+        let result = pager.turn(PageDir::Next, 1).await;
+        assert!(
+            matches!(&result, Ok(PageTurn::Page(items)) if items.len() == 1
+                && items[0].id == "f100"),
+            "page 2 of 3 (offset 100) must be fetched, got {result:?}"
+        );
+        let _ = std::fs::remove_file(store.path());
+
+        // Same refusal logic on the search pager, purely from the total.
+        let mut pager = search_pager(Some(providers::PageCursor::Giphy { offset: 50 }), Some(100));
+        assert!(matches!(
+            pager.turn(PageDir::Next, 1).await,
+            Ok(PageTurn::AtLast)
+        ));
+    }
+
     #[test]
     fn apply_page_replaces_items_and_resets_cursor() {
         let mut app = test_app(items(40));
@@ -1774,8 +1889,12 @@ mod tests {
             .await;
 
         let cfg = cfg_for(&server.uri());
-        let mut app = App::new(cfg.clone(), reqwest::Client::new(), providers::Source::Auto);
-        app.set_favs_client(Some(FavsClient::new(&cfg).unwrap()));
+        let mut app = App::new(
+            cfg.clone(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            server_backend(&cfg),
+        );
         app.search.items = items(1);
 
         assert!(!app.fav_ids.contains("id0"));
@@ -1801,8 +1920,12 @@ mod tests {
             .await;
 
         let cfg = cfg_for(&server.uri());
-        let mut app = App::new(cfg.clone(), reqwest::Client::new(), providers::Source::Auto);
-        app.set_favs_client(Some(FavsClient::new(&cfg).unwrap()));
+        let mut app = App::new(
+            cfg.clone(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            server_backend(&cfg),
+        );
         app.search.items = items(1);
 
         app.toggle_favorite().await;
@@ -1812,15 +1935,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn toggle_without_client_is_footnoted() {
-        let mut app = test_app(items(1));
+    async fn toggle_local_backend_writes_store() {
+        let path = local_store_path();
+        let mut app = App::new(
+            Config::default(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            FavsBackend::Local(LocalStore::at(&path)),
+        );
+        app.search.items = items(1);
+
         app.toggle_favorite().await;
-        assert!(app.fav_ids.is_empty());
+        assert!(app.fav_ids.contains("id0"));
         assert!(app
             .status
             .as_deref()
             .unwrap()
-            .contains("favorites not configured"));
+            .contains("saved to local favorites"));
+        let stored = LocalStore::at(&path).load().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "id0");
+        assert_eq!(stored[0].url, "https://gifdeck.test/0.gif");
+
+        app.toggle_favorite().await;
+        assert!(!app.fav_ids.contains("id0"));
+        assert!(LocalStore::at(&path).load().unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn toggle_local_backend_surfaces_damaged_store() {
+        let path = local_store_path();
+        std::fs::write(&path, "{ broken").unwrap();
+        let mut app = App::new(
+            Config::default(),
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            FavsBackend::Local(LocalStore::at(&path)),
+        );
+        app.search.items = items(1);
+
+        app.toggle_favorite().await;
+        assert!(app.fav_ids.is_empty(), "a damaged store must not be toggled");
+        let status = app.status.as_deref().unwrap();
+        assert!(status.contains("favorite failed"), "got: {status}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
@@ -1841,13 +2000,17 @@ mod tests {
             .await;
 
         let cfg = cfg_for(&server.uri());
-        let client = FavsClient::new(&cfg).unwrap();
-        let mut app = App::new(cfg, reqwest::Client::new(), providers::Source::Auto);
-        app.set_favs_client(Some(client.clone()));
+        let backend = server_backend(&cfg);
+        let mut app = App::new(
+            cfg,
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            backend.clone(),
+        );
         app.favorites.items = items(3);
         app.favorites.selected = 1;
         app.favorites.page = 0;
-        app.favorites.pager = Some(Pager::favs(client, Some(3)));
+        app.favorites.pager = Some(Pager::favs(backend, Some(3)));
 
         app.refresh_favorites_page().await;
         assert_eq!(app.favorites.items.len(), 2);
@@ -1882,12 +2045,16 @@ mod tests {
             .await;
 
         let cfg = cfg_for(&server.uri());
-        let client = FavsClient::new(&cfg).unwrap();
-        let mut app = App::new(cfg, reqwest::Client::new(), providers::Source::Auto);
-        app.set_favs_client(Some(client.clone()));
+        let backend = server_backend(&cfg);
+        let mut app = App::new(
+            cfg,
+            reqwest::Client::new(),
+            providers::Source::Auto,
+            backend.clone(),
+        );
         app.favorites.items = items(1);
         app.favorites.page = 1;
-        app.favorites.pager = Some(Pager::favs(client, Some(51)));
+        app.favorites.pager = Some(Pager::favs(backend, Some(51)));
 
         app.refresh_favorites_page().await;
         assert_eq!(app.favorites.page, 0, "emptied page steps back to page 0");

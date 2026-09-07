@@ -5,6 +5,7 @@ mod config;
 mod favs;
 mod preview;
 mod providers;
+mod store;
 
 use std::collections::HashSet;
 use std::io::IsTerminal;
@@ -23,7 +24,9 @@ async fn main() -> anyhow::Result<()> {
             max,
             json,
         } => cmd_search(query, source, max, json).await,
-        Command::Favs { json } => cmd_favs(json).await,
+        Command::Favs { json, export, import } => {
+            cmd_favs(json, export, import).await
+        }
         Command::Tui { query, favs } => cmd_tui(query, favs).await,
     }
 }
@@ -51,10 +54,59 @@ async fn cmd_search(query: String, source: String, max: usize, json: bool) -> an
     Ok(())
 }
 
-async fn cmd_favs(json: bool) -> anyhow::Result<()> {
+async fn cmd_favs(json: bool, export: bool, import: bool) -> anyhow::Result<()> {
     let cfg = config::config();
-    let client = favs::FavsClient::new(cfg)?;
-    let items = client.list().await?;
+    let backend = favs::FavsBackend::from_config(cfg);
+
+    // The only sanctioned server↔local crossover: explicit transfers.
+    if export {
+        let items = match &backend {
+            favs::FavsBackend::Server(client) => client.list().await?,
+            favs::FavsBackend::Local(_) => anyhow::bail!(
+                "--export copies the server's favorites into the local store; \
+                 no favorites server is configured"
+            ),
+        };
+        let target = store::LocalStore::new();
+        let n = items.len();
+        target.save_all(&items)?;
+        println!("exported {n} favorites to {}", target.path().display());
+        return Ok(());
+    }
+    if import {
+        let client = match &backend {
+            favs::FavsBackend::Server(client) => client,
+            favs::FavsBackend::Local(_) => anyhow::bail!(
+                "--import pushes the local store's favorites onto the server; \
+                 no favorites server is configured"
+            ),
+        };
+        let source = store::LocalStore::new();
+        let items = source.load()?;
+        if items.is_empty() {
+            println!(
+                "local favorites store is empty ({}) — nothing to import",
+                source.path().display()
+            );
+            return Ok(());
+        }
+        let total = items.len();
+        let mut ok = 0usize;
+        let mut last_err = None;
+        for item in &items {
+            match client.save(&item.to_gif_result()).await {
+                Ok(_) => ok += 1,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        println!("imported {ok}/{total} local favorites to the server");
+        if let Some(e) = last_err {
+            eprintln!("gifdeck: warning: some favorites failed to import: {e}");
+        }
+        return Ok(());
+    }
+
+    let items = backend.list().await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&items)?);
     } else {
@@ -65,8 +117,9 @@ async fn cmd_favs(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the unified picker App: favorites client + favorite-ID set
-/// (best-effort — the picker still opens when the server is unreachable,
+/// Build the unified picker App: favorites backend (server or local
+/// store, from the config) + favorite-ID set (best-effort in server
+/// mode — the picker still opens when the server is unreachable,
 /// surfacing the error in the footer), initial search / favorites pages
 /// when the CLI asked for them.
 async fn cmd_tui(query: Option<String>, favs_only: bool) -> anyhow::Result<()> {
@@ -75,22 +128,27 @@ async fn cmd_tui(query: Option<String>, favs_only: bool) -> anyhow::Result<()> {
     }
     let cfg = config::config();
     let http = http_client()?;
+    let backend = favs::FavsBackend::from_config(cfg);
 
-    let mut picker = app::App::new(cfg.clone(), http.clone(), providers::Source::Auto);
-
-    // Favorites client + favorite-ID set (drives ★/☆ and v toggling).
-    match favs::FavsClient::new(cfg) {
-        Ok(client) => {
-            match client.list().await {
-                Ok(items) => {
-                    let ids: HashSet<String> = items.into_iter().map(|f| f.id).collect();
-                    picker.set_fav_ids(ids);
-                }
-                Err(e) => picker.set_status(format!("favorites unavailable: {e}")),
-            }
-            picker.set_favs_client(Some(client));
+    // Favorite-ID set (drives ★/☆ and v toggling).
+    let mut initial_status = None;
+    let ids = match backend.list().await {
+        Ok(items) => items.into_iter().map(|f| f.id).collect::<HashSet<_>>(),
+        Err(e) => {
+            initial_status = Some(format!("favorites unavailable: {e}"));
+            HashSet::new()
         }
-        Err(e) => picker.set_status(format!("favorites unavailable: {e}")),
+    };
+
+    let mut picker = app::App::new(
+        cfg.clone(),
+        http.clone(),
+        providers::Source::Auto,
+        backend,
+    );
+    picker.set_fav_ids(ids);
+    if let Some(s) = initial_status {
+        picker.set_status(s);
     }
 
     let start_tab = if favs_only {
@@ -136,16 +194,15 @@ async fn cmd_tui(query: Option<String>, favs_only: bool) -> anyhow::Result<()> {
 
     // Starting on Favorites: load page 0 up front.
     if start_tab == app::Tab::Favorites {
-        if let Some(client) = picker.favs_client.clone() {
-            match client.list_page(app::PAGE_SIZE, 0).await {
-                Ok(p) => {
-                    let items: Vec<app::UrlItem> =
-                        p.items.into_iter().map(app::UrlItem::from).collect();
-                    let pager = app::Pager::favs(client, p.total);
-                    picker.set_favorites_page(items, pager);
-                }
-                Err(e) => picker.set_status(format!("favorites load failed: {e}")),
+        let backend = picker.favs.clone();
+        match backend.list_page(app::PAGE_SIZE, 0).await {
+            Ok(p) => {
+                let items: Vec<app::UrlItem> =
+                    p.items.into_iter().map(app::UrlItem::from).collect();
+                let pager = app::Pager::favs(backend, p.total);
+                picker.set_favorites_page(items, pager);
             }
+            Err(e) => picker.set_status(format!("favorites load failed: {e}")),
         }
     }
 

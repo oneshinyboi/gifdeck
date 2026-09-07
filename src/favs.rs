@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::providers::GifResult;
+use crate::providers::{GifResult, Provider};
+use crate::store::LocalStore;
 
 /// Timeout for every favorites HTTP request.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A favorite item as stored on the server.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// A favorite item as stored on the server (and, in the same shape, in
+/// the local favorites store).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FavItem {
     pub id: String,
     pub url: String,
@@ -23,6 +25,44 @@ pub struct FavItem {
     pub added_at: Option<String>,
     #[serde(default)]
     pub last_used: Option<String>,
+}
+
+impl FavItem {
+    /// Build a favorite from a search result, as the server does on POST
+    /// and the local store does on insert.
+    pub fn from_gif(gif: &GifResult) -> Self {
+        FavItem {
+            id: gif.id.clone(),
+            url: gif.url.clone(),
+            preview: gif.preview_url.clone(),
+            provider: gif.provider.label().to_string(),
+            title: gif.title.clone(),
+            use_count: 0,
+            added_at: Some(now_epoch()),
+            last_used: None,
+        }
+    }
+
+    /// Reconstruct the `GifResult` needed to re-save this favorite
+    /// (e.g. `favs --import` pushing the local store to the server).
+    pub fn to_gif_result(&self) -> GifResult {
+        GifResult {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            url: self.url.clone(),
+            preview_url: self.preview.clone(),
+            provider: Provider::from_label(&self.provider),
+        }
+    }
+}
+
+/// Wall-clock seconds since the Unix epoch, as the local store's
+/// `added_at` timestamp (kept opaque; nothing parses it back).
+fn now_epoch() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
 }
 
 /// One page of the favorites list plus the server-reported total.
@@ -203,6 +243,80 @@ impl FavsClient {
     }
 }
 
+/// Where favorites live: the self-hosted server, or the local store.
+///
+/// The two are alternatives, never a fallback for one another — the
+/// backend is picked once from the config (token configured → server,
+/// otherwise local). The only crossover between them is the explicit
+/// `favs --export` / `favs --import` commands.
+#[derive(Debug, Clone)]
+pub enum FavsBackend {
+    Server(FavsClient),
+    Local(LocalStore),
+}
+
+impl FavsBackend {
+    /// Backend implied by the config: the server when a favorites token
+    /// is configured, otherwise the local store.
+    pub fn from_config(cfg: &Config) -> Self {
+        if cfg.use_server_favorites() {
+            if let Ok(client) = FavsClient::new(cfg) {
+                return FavsBackend::Server(client);
+            }
+        }
+        FavsBackend::Local(LocalStore::new())
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, FavsBackend::Local(_))
+    }
+
+    /// GET-equivalent: the full favorites list.
+    pub async fn list(&self) -> anyhow::Result<Vec<FavItem>> {
+        match self {
+            FavsBackend::Server(client) => client.list().await,
+            FavsBackend::Local(store) => store.load(),
+        }
+    }
+
+    /// One page of the list plus the total. The local backend paginates
+    /// the file in memory (`limit = 0` means "no limit", like the server).
+    pub async fn list_page(&self, limit: usize, offset: usize) -> anyhow::Result<FavsPage> {
+        match self {
+            FavsBackend::Server(client) => client.list_page(limit, offset).await,
+            FavsBackend::Local(store) => {
+                let items = store.load()?;
+                let total = items.len();
+                let page = items
+                    .into_iter()
+                    .skip(offset)
+                    .take(if limit == 0 { usize::MAX } else { limit })
+                    .collect();
+                Ok(FavsPage {
+                    items: page,
+                    total: Some(total),
+                })
+            }
+        }
+    }
+
+    /// Upsert a favorite from a GifResult.
+    pub async fn save(&self, gif: &GifResult) -> anyhow::Result<FavItem> {
+        match self {
+            FavsBackend::Server(client) => client.save(gif).await,
+            FavsBackend::Local(store) => store.upsert(gif),
+        }
+    }
+
+    /// Remove a favorite by id (idempotent on the local backend).
+    pub async fn delete(&self, id: &str) -> anyhow::Result<()> {
+        match self {
+            FavsBackend::Server(client) => client.delete(id).await,
+            FavsBackend::Local(store) => store.remove(id),
+        }
+    }
+}
+
 fn urlenc(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -375,6 +489,124 @@ mod tests {
 
         let client = client_for(&server.uri());
         client.delete("abc123").await.unwrap();
+    }
+
+    /// A local store per test: tests run in parallel and each needs its own
+    /// file (the atomic write would race on a shared temp path).
+    fn local_store() -> (LocalStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "gifdeck-backend-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("favorites.json");
+        let _ = std::fs::remove_file(&path);
+        (LocalStore::at(&path), path)
+    }
+
+    #[test]
+    fn fav_item_conversions_round_trip() {
+        let fav = FavItem::from_gif(&test_gif());
+        assert_eq!(fav.id, "abc123");
+        assert_eq!(fav.provider, "klipy");
+        assert!(fav.added_at.is_some());
+        assert_eq!(fav.use_count, 0);
+        let gif = fav.to_gif_result();
+        assert_eq!(gif.id, "abc123");
+        assert_eq!(gif.url, test_gif().url);
+        assert_eq!(gif.preview_url, test_gif().preview_url);
+        assert_eq!(gif.provider, Provider::Klipy);
+        // Unknown provider labels parse back as Klipy.
+        let mut weird = fav.clone();
+        weird.provider = "someone-else".into();
+        assert_eq!(weird.to_gif_result().provider, Provider::Klipy);
+    }
+
+    #[test]
+    fn backend_from_config_picks_by_token() {
+        // Token configured → server backend.
+        let cfg = Config {
+            favorites_api: Some("http://cfg-server/api".into()),
+            favorites_token: Some("tok".into()),
+            ..Config::default()
+        };
+        assert!(matches!(
+            FavsBackend::from_config(&cfg),
+            FavsBackend::Server(_)
+        ));
+        assert!(!FavsBackend::from_config(&cfg).is_local());
+
+        // No token → local backend, even with an API configured.
+        let cfg = Config {
+            favorites_api: Some("http://cfg-server/api".into()),
+            favorites_token: None,
+            ..Config::default()
+        };
+        assert!(FavsBackend::from_config(&cfg).is_local());
+
+        // Default config → local.
+        assert!(FavsBackend::from_config(&Config::default()).is_local());
+    }
+
+    #[tokio::test]
+    async fn local_backend_lists_pages_and_toggles() {
+        let (store, path) = local_store();
+        let backend = FavsBackend::Local(store.clone());
+        assert!(backend.is_local());
+
+        assert!(backend.list().await.unwrap().is_empty());
+
+        backend.save(&test_gif()).await.unwrap();
+        backend
+            .save(&GifResult {
+                id: "b1".into(),
+                ..test_gif()
+            })
+            .await
+            .unwrap();
+        backend
+            .save(&GifResult {
+                id: "c1".into(),
+                ..test_gif()
+            })
+            .await
+            .unwrap();
+
+        // Full list.
+        assert_eq!(backend.list().await.unwrap().len(), 3);
+
+        // Paging: limit 2 / offset 1 → items b1, c1 and the known total.
+        let page = backend.list_page(2, 1).await.unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].id, "b1");
+        assert_eq!(page.items[1].id, "c1");
+        assert_eq!(page.total, Some(3));
+
+        // limit 0 means "no limit", like the server's list().
+        assert_eq!(backend.list_page(0, 0).await.unwrap().items.len(), 3);
+
+        // delete is idempotent.
+        backend.delete("b1").await.unwrap();
+        backend.delete("b1").await.unwrap();
+        let items = backend.list().await.unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|f| f.id != "b1"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn local_backend_surfaces_damaged_store_as_error() {
+        let (store, path) = local_store();
+        std::fs::write(&path, "{ broken").unwrap();
+        let backend = FavsBackend::Local(store);
+        let err = backend.list().await.unwrap_err().to_string();
+        assert!(err.contains("invalid local favorites store"), "got: {err}");
+        // Toggles refuse rather than overwrite the damaged store.
+        assert!(backend.save(&test_gif()).await.is_err());
+        assert!(backend.delete("x").await.is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
