@@ -135,7 +135,9 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
-          sha() { grep " ${CRATE}-${VERSION}-$1.tar.gz" dist/SHA256SUMS | awk '{print $1}'; }
+          # Checksums are computed here from the downloaded tarballs
+          # (SHA256SUMS lives in the release, not in an artifact).
+          sha() { sha256sum "dist/${CRATE}-${VERSION}-$1.tar.gz" | awk '{print $1}'; }
           MAC_ARM="$(sha aarch64-apple-darwin)"
           LINUX_ARM="$(sha aarch64-unknown-linux-gnu)"
           LINUX_X64="$(sha x86_64-unknown-linux-gnu)"
