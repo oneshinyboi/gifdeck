@@ -1,5 +1,9 @@
 # gifdeck
 
+<a href="https://crates.io/crates/gifdeck">
+    <img src="https://img.shields.io/crates/v/gifdeck" alt="Crates.io Version" />
+</a>
+
 A GIF picker for the terminal. Search GIPHY and KLIPY, browse results in
 an animated grid, favorite the ones you love, and send them to the
 clipboard — as the actual animated GIF file, or just as a link.
