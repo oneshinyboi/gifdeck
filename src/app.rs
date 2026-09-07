@@ -1187,7 +1187,7 @@ impl App {
 
     fn render_tabs(&self, frame: &mut ratatui::Frame, area: Rect) {
         let active = Style::default()
-            .fg(Color::Yellow)
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
         let dim = Style::default().dim();
         let line = Line::from(vec![
@@ -1214,11 +1214,11 @@ impl App {
         let line = if self.tab == Tab::Search && self.search_focused {
             Line::from(vec![
                 Span::raw(" > "),
-                Span::styled(self.query.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled(self.query.clone(), Style::default().fg(Color::Cyan)),
                 Span::styled(
                     "█",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
             ])
@@ -1278,7 +1278,7 @@ impl App {
         let selected = idx == self.grid().selected;
         let accent = if selected {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
