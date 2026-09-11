@@ -1158,12 +1158,14 @@ impl App {
 
         if let PreviewMode::Graphics { cache, .. } = &self.mode {
             // Headroom (2×) so an overshoot never immediately evicts an
-            // on-screen entry (which would reload it, thrashing the counter).
+            // on-screen entry, plus the in-flight count: queued entries
+            // cannot be evicted, so without that headroom a pileup behind
+            // a slow load (e.g. an enlarged decode) evicts visible Ready
+            // entries instead — the load/unload thrash loop.
             let visible = (self.cols as usize).saturating_mul(self.rows as usize);
-            cache
-                .lock()
-                .unwrap()
-                .set_cap(visible.saturating_mul(2).max(1));
+            let mut guard = cache.lock().unwrap();
+            let in_flight = guard.loading_len();
+            guard.set_cap(visible.saturating_mul(2).saturating_add(in_flight).max(1));
         }
 
         let [tabs_area, search_area] = Layout::default()

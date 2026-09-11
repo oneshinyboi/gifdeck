@@ -99,6 +99,25 @@ impl PreviewCache {
         self.lru.push_back(url.to_string());
     }
 
+    /// Bump an existing entry to the back of the LRU (no-op if untracked).
+    /// Called for still-visible entries on every draw so eviction only
+    /// ever picks off-screen entries: without this, a visible entry's LRU
+    /// position freezes at its completion time, and during an in-flight
+    /// pileup the earliest completions — on-screen gifs — become the
+    /// eviction candidates (the load/unload thrash loop).
+    pub fn touch_url(&mut self, url: &str) {
+        if self.map.contains_key(url) {
+            self.touch(url);
+        }
+    }
+
+    /// Number of in-flight loads. The eviction cap is sized to include
+    /// them: in-flight entries cannot be evicted, so a pileup queued
+    /// behind a slow load must not squeeze Ready entries out of the cap.
+    pub fn loading_len(&self) -> usize {
+        self.loading.len()
+    }
+
     /// Evict least-recently-used entries while over the cap. In-flight
     /// (`Requested`) entries are never evicted: the loader cannot be
     /// cancelled, so dropping the bookkeeping would let the eventual result
@@ -251,7 +270,14 @@ impl PreviewLoader {
 pub fn ensure_requested(cache: &Arc<Mutex<PreviewCache>>, loader: &PreviewLoader, url: &str) {
     let send = {
         let mut guard = cache.lock().unwrap();
-        guard.try_request(url)
+        if guard.try_request(url) {
+            true
+        } else {
+            // Already tracked: bump its LRU position so entries still on
+            // screen stay ahead of anything queued behind a slow load.
+            guard.touch_url(url);
+            false
+        }
     };
     if send {
         loader.request(url);
@@ -270,7 +296,12 @@ pub fn ensure_focus_requested(
     let key = focus_key(url, size);
     let send = {
         let mut guard = focus_cache.lock().unwrap();
-        guard.try_request(&key)
+        if guard.try_request(&key) {
+            true
+        } else {
+            guard.touch_url(&key);
+            false
+        }
     };
     if send {
         loader.request_focus(url, size);
@@ -846,5 +877,77 @@ mod tests {
         c.insert_ready(&focus_key("u", Size::new(2, 2)), empty_cached());
         assert!(c.newest_ready_for("u").is_some());
         assert!(c.newest_ready_for("v").is_none());
+    }
+
+    #[test]
+    fn touch_url_keeps_visible_entries_newest() {
+        let mut c = cache(2);
+        c.try_request("a");
+        c.try_request("b");
+        c.insert_ready("a", empty_cached());
+        c.insert_ready("b", empty_cached());
+        // "a" is still on screen and re-ensured every draw.
+        c.touch_url("a");
+        assert!(c.try_request("c"));
+        assert!(c.get("a").is_some(), "touched entry survives");
+        assert!(c.get("b").is_none(), "untouched entry evicted first");
+        // Touching an untracked url is a no-op.
+        c.touch_url("zzz");
+        assert_eq!(c.len(), 2);
+    }
+
+    /// Regression test for the overlay thrash loop: visible gifs complete
+    /// while a pileup of newer requests stalls in flight behind a slow
+    /// (enlarged) decode. Mirrors what `draw` does each tick: re-ensure
+    /// the visible set (touching it) and size the cap to the in-flight
+    /// count.
+    #[test]
+    fn in_flight_pileup_never_evicts_visible_ready_entries() {
+        let visible = 4;
+        let vis = ["v1", "v2", "v3", "v4"];
+        let mut c = cache(visible * 2);
+
+        // The visible window loads and completes.
+        for k in vis {
+            assert!(c.try_request(k));
+        }
+        for k in vis {
+            c.insert_ready(k, empty_cached());
+        }
+
+        // Scrolling while the loader is stalled: a pile of new requests
+        // goes in flight (none can complete), each "draw" touching the
+        // visible set and raising the cap by the in-flight count.
+        for i in 0..10 {
+            assert!(c.try_request(&format!("n{i}")));
+            c.set_cap(visible * 2 + c.loading_len());
+            for k in vis {
+                c.touch_url(k);
+            }
+        }
+        // Map (14) is far over the static cap (8), yet every visible
+        // Ready entry must survive: everything else is in flight.
+        for k in vis {
+            assert!(c.get(k).is_some(), "{k} (visible, ready) was evicted");
+        }
+
+        // The queue drains: completions land, the cap shrinks back, and
+        // only stale (untouched) entries are evicted.
+        for i in 0..10 {
+            c.insert_ready(&format!("n{i}"), empty_cached());
+            c.set_cap(visible * 2 + c.loading_len());
+            for k in vis {
+                c.touch_url(k);
+            }
+        }
+        for k in vis {
+            assert!(c.get(k).is_some(), "{k} survived the drain");
+        }
+        // The over-cap stale entries were trimmed instead.
+        assert!(
+            c.len() <= visible * 2,
+            "stale entries trimmed, got {}",
+            c.len()
+        );
     }
 }
