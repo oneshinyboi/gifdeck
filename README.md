@@ -3,6 +3,15 @@
 <a href="https://crates.io/crates/gifdeck">
     <img src="https://img.shields.io/crates/v/gifdeck" alt="Crates.io Version" />
 </a>
+<a href="https://github.com/oneshinyboi/gifdeck/actions/workflows/ci.yml">
+    <img src="https://github.com/oneshinyboi/gifdeck/actions/workflows/ci.yml/badge.svg" alt="GitHub Actions CI" />
+</a>
+<a href="https://github.com/oneshinyboi/homebrew-tap">
+    <img src="https://img.shields.io/badge/homebrew-oneshinyboi%2Ftap-orange?logo=homebrew&logoColor=white" alt="Homebrew Tap" />
+</a>
+<a href="https://www.rust-lang.org">
+    <img src="https://img.shields.io/badge/made%20with-rust-dea584?logo=rust&logoColor=white" alt="Made with Rust" />
+</a>
 
 A GIF picker for the terminal. Search GIPHY and KLIPY, browse results in
 an animated grid, favorite the ones you love, and send them to the
