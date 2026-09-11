@@ -1053,12 +1053,12 @@ impl App {
         match key.code {
             KeyCode::Tab => self.switch_tab(),
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char(' ') => match pending_count
-                .and_then(|b| b.parse::<usize>().ok())
-            {
-                Some(n) => self.select_number(n),
-                None => self.choose(),
-            },
+            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char(' ') => {
+                match pending_count.and_then(|b| b.parse::<usize>().ok()) {
+                    Some(n) => self.select_number(n),
+                    None => self.choose(),
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 let cols = self.cols.max(1) as usize;
                 self.step(|i| nav_down(i, cols, len));
@@ -1374,7 +1374,7 @@ impl App {
             .map(|b| format!("{b}_ · "))
             .unwrap_or_default();
         let nav_line = format!(
-            "{count_note}{} items{page_note} · ←↑↓→ / hjkl move · 1-50 + Enter jump · u/d page · p enlarge · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}",
+            "{count_note}{} items{page_note} · ←↑↓→ / hjkl move · 1-50 + Enter jump · u/d page · Tab switch · q quit{fallback_note}",
             self.grid().items.len()
         );
         let status_note = self
@@ -1387,8 +1387,9 @@ impl App {
         } else {
             ""
         };
-        let action_line =
-            format!("Tab switch · D download · c copy gif · y copy url · v favorite{mode_note}{status_note}");
+        let action_line = format!(
+            "p enlarge · Enter/Space pick · D download · c copy gif · y copy url · v favorite{mode_note}{loaded_note}{requested_note}{failed_note}{status_note}"
+        );
 
         let [footer_nav, footer_actions] = Layout::default()
             .direction(Direction::Vertical)
@@ -3152,7 +3153,10 @@ mod tests {
         assert_eq!(marquee_window("abcdef", 6, 4), "   a");
         assert_eq!(marquee_window("abcdef", 7, 4), "  ab");
         // Offsets past the cycle length stay in range.
-        assert_eq!(marquee_window("abcdef", 9, 4), marquee_window("abcdef", 0, 4));
+        assert_eq!(
+            marquee_window("abcdef", 9, 4),
+            marquee_window("abcdef", 0, 4)
+        );
     }
 
     #[test]
