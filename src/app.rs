@@ -486,6 +486,9 @@ pub struct App {
     /// Last time the marquee advanced (paced from `draw`, which runs
     /// roughly every event-loop tick).
     last_marquee: Instant,
+    /// Digits typed so far for the pending "go to item n" jump
+    /// (committed by Enter/Space; flushed by any other key).
+    count_buf: Option<String>,
     /// Action requested via keypress, executed by the event loop.
     pub pending: Option<Pending>,
     /// Background clipboard/download jobs: `job_rx` receives results
@@ -522,6 +525,7 @@ impl App {
             status: None,
             marquee: None,
             last_marquee: Instant::now(),
+            count_buf: None,
             pending: None,
             job_tx,
             job_rx,
@@ -1033,10 +1037,28 @@ impl App {
             return;
         }
         let len = self.grid().items.len();
+        // Digits accumulate the pending "go to item n" number, committed
+        // by Enter/Space; any other key flushes it and acts as usual.
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_digit()
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                self.push_count_digit(c);
+                return;
+            }
+        }
+        let pending_count = self.count_buf.take();
         match key.code {
             KeyCode::Tab => self.switch_tab(),
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char(' ') => self.choose(),
+            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char(' ') => match pending_count
+                .and_then(|b| b.parse::<usize>().ok())
+            {
+                Some(n) => self.select_number(n),
+                None => self.choose(),
+            },
             KeyCode::Char('j') | KeyCode::Down => {
                 let cols = self.cols.max(1) as usize;
                 self.step(|i| nav_down(i, cols, len));
@@ -1206,6 +1228,41 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// Accumulate a digit of the pending "go to item n" number. The
+    /// buffer holds at most two digits (1-50); a two-digit value past 50
+    /// is rejected immediately so the user sees the mistake early.
+    fn push_count_digit(&mut self, c: char) {
+        let buf = self.count_buf.get_or_insert_with(String::new);
+        if buf.len() >= 2 {
+            return;
+        }
+        buf.push(c);
+        if let Ok(n) = buf.parse::<usize>() {
+            if n > 50 {
+                self.count_buf = None;
+                self.status = Some("number must be 1-50".into());
+            }
+        }
+    }
+
+    /// Commit the pending number (Enter/Space): move the cursor to item
+    /// `n` (1-based within the current page/grid) and scroll it into
+    /// view. Enter with no pending number picks instead (see handle_key).
+    fn select_number(&mut self, n: usize) {
+        if n == 0 || n > 50 {
+            self.status = Some("number must be 1-50".into());
+            return;
+        }
+        let len = self.grid().items.len();
+        if n > len {
+            self.status = Some(format!("no item {n}"));
+            return;
+        }
+        self.grid_mut().selected = n - 1;
+        self.ensure_visible();
+        self.marquee = None;
+    }
+
     /// Ask the loader to fetch previews for the cells nearest the cursor,
     /// in order of increasing distance. The cache cap is sized to the visible
     /// grid, so every visible cell is fetched and none is evicted while shown.
@@ -1311,8 +1368,13 @@ impl App {
             .as_ref()
             .map(|pager| format!(" · {}", page_label(self.grid().page, pager.total())))
             .unwrap_or_default();
+        let count_note = self
+            .count_buf
+            .as_ref()
+            .map(|b| format!("{b}_ · "))
+            .unwrap_or_default();
         let nav_line = format!(
-            "{} items{page_note} · ←↑↓→ / hjkl move · u/d page · p enlarge · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}",
+            "{count_note}{} items{page_note} · ←↑↓→ / hjkl move · 1-50 + Enter jump · u/d page · p enlarge · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}",
             self.grid().items.len()
         );
         let status_note = self
@@ -3112,5 +3174,111 @@ mod tests {
         app.search.selected = 0;
         app.tick_marquee();
         assert_eq!(app.marquee_offset(&app.search.items[0]), 0);
+    }
+
+    #[test]
+    fn digits_then_enter_select_item_n() {
+        let mut app = test_app(items(20));
+        for c in "17".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.count_buf.as_deref(), Some("17"));
+        // Enter with a pending number moves the cursor instead of picking.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.search.selected, 16);
+        assert_eq!(app.count_buf, None);
+        assert!(!app.should_quit, "jumping must not pick/quit");
+    }
+
+    #[test]
+    fn single_digit_then_enter_selects() {
+        let mut app = test_app(items(20));
+        app.handle_key(key(KeyCode::Char('7')));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.search.selected, 6);
+    }
+
+    #[test]
+    fn enter_without_digits_still_picks() {
+        let mut app = test_app(items(20));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.should_quit);
+        assert!(app.selected_url.is_some());
+    }
+
+    #[test]
+    fn number_past_item_count_is_rejected() {
+        let mut app = test_app(items(5));
+        for c in "12".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.search.selected, 0);
+        assert_eq!(app.status.as_deref(), Some("no item 12"));
+    }
+
+    #[test]
+    fn two_digit_number_past_50_is_rejected_immediately() {
+        let mut app = test_app(items(50));
+        app.handle_key(key(KeyCode::Char('6')));
+        app.handle_key(key(KeyCode::Char('0')));
+        assert_eq!(app.count_buf, None);
+        assert_eq!(app.status.as_deref(), Some("number must be 1-50"));
+        // Enter then falls through to a plain pick.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn buffer_caps_at_two_digits() {
+        let mut app = test_app(items(50));
+        for c in "123".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.count_buf.as_deref(), Some("12"));
+    }
+
+    #[test]
+    fn non_digit_key_flushes_pending_number() {
+        let mut app = test_app(items(20));
+        app.handle_key(key(KeyCode::Char('1')));
+        // Any other key acts normally and drops the pending number.
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.count_buf, None);
+        assert_eq!(app.search.selected, 1, "j moved down one row");
+        // Enter now picks (no pending number).
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn number_jump_selects_out_of_view_item() {
+        let mut app = test_app(items(50));
+        app.cols = 4;
+        app.rows = 2;
+        app.ensure_visible();
+        assert_eq!(app.search.first_item, 0);
+        for c in "30".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.search.selected, 29);
+        // The cursor jumped past the visible window, so the window moved.
+        let visible = (app.rows as usize) * (app.cols as usize);
+        assert!(app.search.selected >= app.search.first_item);
+        assert!(app.search.selected < app.search.first_item + visible);
+    }
+
+    #[test]
+    fn digits_type_into_search_box_when_focused() {
+        let mut app = test_app(items(5));
+        app.search_focused = true;
+        app.handle_key(key(KeyCode::Char('4')));
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(app.query, "42");
+        assert_eq!(app.count_buf, None);
+        // Enter runs the search, it does not jump.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.pending, Some(Pending::Search));
     }
 }
