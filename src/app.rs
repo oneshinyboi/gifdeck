@@ -10,10 +10,10 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Terminal;
 use ratatui_image::picker::{Picker, ProtocolType};
 use tokio::sync::mpsc;
@@ -436,6 +436,9 @@ pub fn nearest_slots(
 pub enum PreviewMode {
     Graphics {
         cache: Arc<Mutex<PreviewCache>>,
+        /// Enlarged (overlay) previews; tiny LRU since only one is shown
+        /// at a time.
+        focus_cache: Arc<Mutex<PreviewCache>>,
         loader: PreviewLoader,
     },
     Fallback,
@@ -465,6 +468,9 @@ pub struct App {
     should_quit: bool,
     selected_url: Option<String>,
     mode: PreviewMode,
+    /// Enlarged preview: the preview URL of the item being shown. While
+    /// set, the overlay is modal (only Enter/Space/Esc/q/p reach the app).
+    focus: Option<String>,
     /// Transient footer message (page-turn feedback, load errors).
     pub status: Option<String>,
     /// Action requested via keypress, executed by the event loop.
@@ -499,6 +505,7 @@ impl App {
             should_quit: false,
             selected_url: None,
             mode: PreviewMode::Fallback,
+            focus: None,
             status: None,
             pending: None,
             job_tx,
@@ -565,8 +572,17 @@ impl App {
         g.items.get(g.selected)
     }
 
-    pub fn enable_previews(&mut self, cache: Arc<Mutex<PreviewCache>>, loader: PreviewLoader) {
-        self.mode = PreviewMode::Graphics { cache, loader };
+    pub fn enable_previews(
+        &mut self,
+        cache: Arc<Mutex<PreviewCache>>,
+        focus_cache: Arc<Mutex<PreviewCache>>,
+        loader: PreviewLoader,
+    ) {
+        self.mode = PreviewMode::Graphics {
+            cache,
+            focus_cache,
+            loader,
+        };
     }
 
     /// Keep `selected` inside the visible window while staying row-aligned.
@@ -961,6 +977,10 @@ impl App {
             self.should_quit = true;
             return;
         }
+        if self.focus.is_some() {
+            self.handle_focus_key(key);
+            return;
+        }
         if self.search_focused {
             self.handle_search_key(key);
             return;
@@ -1016,6 +1036,7 @@ impl App {
                     self.pending = Some(Pending::CopyUrl);
                 }
             }
+            KeyCode::Char('p') => self.open_enlarged(),
             KeyCode::Home => {
                 self.grid_mut().selected = 0;
                 self.ensure_visible();
@@ -1069,12 +1090,38 @@ impl App {
         }
     }
 
+    /// Keys while the enlarged overlay is open: it is fully modal — Enter
+    /// or Space pick the GIF, Esc/q/p close the overlay, everything else
+    /// (including navigation and Tab) is swallowed so the selection stays
+    /// on the enlarged item.
+    fn handle_focus_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char(' ') => {
+                self.focus = None;
+                self.choose();
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => {
+                self.focus = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the enlarged overlay for the selected item. The decode request
+    /// is issued by the next `draw` (which knows the current overlay size),
+    /// so nothing else is needed here.
+    fn open_enlarged(&mut self) {
+        if let Some(item) = self.active_item() {
+            self.focus = Some(item.preview_url.clone());
+        }
+    }
+
     /// Ask the loader to fetch previews for the cells nearest the cursor,
     /// in order of increasing distance. The cache cap is sized to the visible
     /// grid, so every visible cell is fetched and none is evicted while shown.
     fn request_previews(&self) {
         let (cache, loader) = match &self.mode {
-            PreviewMode::Graphics { cache, loader } => (cache, loader),
+            PreviewMode::Graphics { cache, loader, .. } => (cache, loader),
             PreviewMode::Fallback => return,
         };
         let cols = (self.cols as usize).max(1);
@@ -1166,7 +1213,7 @@ impl App {
             .map(|pager| format!(" · {}", page_label(self.grid().page, pager.total())))
             .unwrap_or_default();
         let nav_line = format!(
-            "{} items{page_note} · ←↑↓→ / hjkl move · u/d page · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}",
+            "{} items{page_note} · ←↑↓→ / hjkl move · u/d page · p enlarge · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}",
             self.grid().items.len()
         );
         let status_note = self
@@ -1188,6 +1235,24 @@ impl App {
             .areas(footer_area);
         frame.render_widget(Paragraph::new(nav_line), footer_nav);
         frame.render_widget(Paragraph::new(action_line), footer_actions);
+
+        if let Some(url) = self.focus.clone() {
+            let want = enlarged_size(area);
+            // Requested every draw: a terminal resize yields a different
+            // `want`, which starts a re-decode (the focus cache is keyed
+            // by url + size) while the old frames keep rendering.
+            if let PreviewMode::Graphics {
+                focus_cache,
+                loader,
+                ..
+            } = &self.mode
+            {
+                if !url.is_empty() {
+                    preview::ensure_focus_requested(focus_cache, loader, &url, want);
+                }
+            }
+            self.render_enlarged(frame, area, &url, want);
+        }
     }
 
     fn render_tabs(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -1321,7 +1386,7 @@ impl App {
                         .constraints([Constraint::Length(image_h), Constraint::Min(1)])
                         .areas(inner);
                     if !item.preview_url.is_empty() {
-                        preview::render_preview(frame, img_area, cache, &item.preview_url);
+                        preview::render_preview(frame, img_area, cache, &item.preview_url, false);
                     }
                     frame.render_widget(
                         Paragraph::new(truncate(title, text_area.width)).style(accent),
@@ -1337,6 +1402,59 @@ impl App {
             }
         }
     }
+
+    /// Render the modal enlarged overlay for `url` on top of everything
+    /// else (called last from `draw`). `want` is the overlay's current
+    /// cell size, used to pick (or re-request) the right decode.
+    fn render_enlarged(&self, frame: &mut ratatui::Frame, area: Rect, url: &str, want: Size) {
+        let popup = centered_rect(area, ENLARGED_PERCENT, ENLARGED_PERCENT);
+        if popup.width < 3 || popup.height < 3 {
+            return;
+        }
+        frame.render_widget(Clear, popup);
+
+        let item = self.grid().items.get(self.grid().selected);
+        let title = item.map(|i| i.title.trim().to_string()).unwrap_or_default();
+        let star = item
+            .map(|i| {
+                if self.fav_ids.contains(&i.id) {
+                    "★"
+                } else {
+                    "☆"
+                }
+            })
+            .unwrap_or("☆");
+        let headline = format!("{star} {}", truncate(&title, popup.width.saturating_sub(2)));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .title(headline);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        match &self.mode {
+            PreviewMode::Graphics { focus_cache, .. } => {
+                if !url.is_empty() {
+                    preview::render_focus_preview(frame, inner, focus_cache, url, want);
+                }
+            }
+            PreviewMode::Fallback => {
+                frame.render_widget(
+                    Paragraph::new(truncate(&title, inner.width))
+                        .alignment(Alignment::Center)
+                        .style(Style::default().dim()),
+                    inner,
+                );
+            }
+        }
+    }
 }
 
 fn truncate(s: &str, width: u16) -> String {
@@ -1347,6 +1465,30 @@ fn truncate(s: &str, width: u16) -> String {
     let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// Share of the terminal (in each dimension) covered by the enlarged
+/// overlay.
+const ENLARGED_PERCENT: u16 = 80;
+
+/// Cell size used for enlarged decodes: the inner area of the overlay
+/// (borders excluded).
+fn enlarged_size(term: Rect) -> Size {
+    let popup = centered_rect(term, ENLARGED_PERCENT, ENLARGED_PERCENT);
+    Size::new(
+        popup.width.saturating_sub(2).max(1),
+        popup.height.saturating_sub(2).max(1),
+    )
+}
+
+/// A rect covering `pct_x`% of `area`'s width and `pct_y`% of its height,
+/// centered inside `area`.
+fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+    let w = (area.width.saturating_mul(pct_x) / 100).max(1);
+    let h = (area.height.saturating_mul(pct_y) / 100).max(1);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    Rect::new(x, y, w, h)
 }
 
 /// Run the unified picker. Returns the selected GIF URL, if any.
@@ -1369,8 +1511,16 @@ pub async fn run(mut app: App) -> Result<Option<String>> {
                     .build()
                     .unwrap_or_default();
                 let cache = Arc::new(Mutex::new(PreviewCache::new(MAX_CACHE_CAP)));
-                let loader = PreviewLoader::new(client, Arc::clone(&cache), picker);
-                app.enable_previews(cache, loader);
+                // A few slots: current overlay size + the previous ones
+                // kept rendering during a resize, before LRU eviction.
+                let focus_cache = Arc::new(Mutex::new(PreviewCache::new(4)));
+                let loader = PreviewLoader::new(
+                    client,
+                    Arc::clone(&cache),
+                    Arc::clone(&focus_cache),
+                    picker,
+                );
+                app.enable_previews(cache, focus_cache, loader);
             }
             _ => {}
         }
@@ -2531,5 +2681,108 @@ mod tests {
         assert_eq!(page_label(4, Some(24310)), "page 5/487");
         assert_eq!(page_label(2, None), "page 3");
         assert_eq!(page_label(0, Some(0)), "page 1");
+    }
+
+    #[test]
+    fn centered_rect_covers_eighty_percent() {
+        assert_eq!(
+            centered_rect(Rect::new(0, 0, 100, 50), ENLARGED_PERCENT, ENLARGED_PERCENT),
+            Rect::new(10, 5, 80, 40)
+        );
+        // Tiny terminals still get a 1x1 popup, never zero.
+        assert_eq!(
+            centered_rect(Rect::new(0, 0, 1, 1), ENLARGED_PERCENT, ENLARGED_PERCENT),
+            Rect::new(0, 0, 1, 1)
+        );
+    }
+
+    #[test]
+    fn enlarged_size_excludes_borders() {
+        assert_eq!(enlarged_size(Rect::new(0, 0, 100, 50)), Size::new(78, 38));
+        assert_eq!(enlarged_size(Rect::new(0, 0, 0, 0)), Size::new(1, 1));
+    }
+
+    #[test]
+    fn enlarged_open_close_and_toggle() {
+        let mut app = test_app(items(3));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(
+            app.focus.as_deref(),
+            Some("https://gifdeck.test/0-preview.gif")
+        );
+
+        // While open, q closes the overlay instead of quitting.
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.focus.is_none());
+        assert!(!app.should_quit);
+
+        // Esc closes too, and p toggles.
+        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.focus.is_none());
+        assert!(!app.should_quit);
+        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.focus.is_none());
+    }
+
+    #[test]
+    fn enlarged_enter_picks_gif() {
+        let mut app = test_app(items(3));
+        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.focus.is_none());
+        assert_eq!(
+            app.selected_url.as_deref(),
+            Some("https://gifdeck.test/0.gif")
+        );
+        assert!(app.should_quit);
+        assert!(matches!(app.pending, Some(Pending::Use(_))));
+    }
+
+    #[test]
+    fn enlarged_space_picks_gif() {
+        let mut app = test_app(items(3));
+        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.selected_url.as_deref(),
+            Some("https://gifdeck.test/0.gif")
+        );
+    }
+
+    #[test]
+    fn enlarged_is_modal() {
+        let mut app = test_app(items(5));
+        app.handle_key(key(KeyCode::Char('p')));
+        // Navigation, tab and search focus are all swallowed while open.
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Down,
+            KeyCode::Char('k'),
+            KeyCode::Up,
+            KeyCode::Char('h'),
+            KeyCode::Char('l'),
+            KeyCode::Tab,
+            KeyCode::Char('/'),
+            KeyCode::Char('v'),
+            KeyCode::Char('D'),
+            KeyCode::Char('d'),
+        ] {
+            app.handle_key(key(code));
+        }
+        assert!(app.focus.is_some(), "overlay stays open");
+        assert_eq!(app.search.selected, 0, "selection unchanged");
+        assert_eq!(app.tab, Tab::Search, "tab unchanged");
+        assert!(!app.search_focused);
+        assert!(app.pending.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn enlarged_needs_no_item_to_open() {
+        let mut app = test_app(Vec::new());
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.focus.is_none());
     }
 }
