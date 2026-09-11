@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -89,6 +89,13 @@ pub const MIN_CELL_W: u16 = PREVIEW_SIZE.width + 2;
 const CELL_EXTRA_H: u16 = 3;
 /// Items per page when paging against a server (u / d).
 pub const PAGE_SIZE: usize = 50;
+
+/// How often the selected item's title advances by one character while
+/// it overflows its window (marquee scroll).
+const MARQUEE_INTERVAL: Duration = Duration::from_millis(150);
+/// Blank gap appended to the marquee text so its tail and head don't
+/// butt together when the window wraps around.
+const MARQUEE_GAP: usize = 3;
 
 /// The two tabs of the unified picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,6 +480,12 @@ pub struct App {
     focus: Option<String>,
     /// Transient footer message (page-turn feedback, load errors).
     pub status: Option<String>,
+    /// Marquee state for the selected item's title: `(item id, char
+    /// offset)`. Reset whenever the selection moves to another item.
+    marquee: Option<(String, usize)>,
+    /// Last time the marquee advanced (paced from `draw`, which runs
+    /// roughly every event-loop tick).
+    last_marquee: Instant,
     /// Action requested via keypress, executed by the event loop.
     pub pending: Option<Pending>,
     /// Background clipboard/download jobs: `job_rx` receives results
@@ -507,6 +520,8 @@ impl App {
             mode: PreviewMode::Fallback,
             focus: None,
             status: None,
+            marquee: None,
+            last_marquee: Instant::now(),
             pending: None,
             job_tx,
             job_rx,
@@ -1148,6 +1163,49 @@ impl App {
         }
     }
 
+    /// Advance the selected item's title marquee: reset when the selection
+    /// moves to another item, and step one character per `MARQUEE_INTERVAL`
+    /// while the title overflows the grid text strip (short titles never
+    /// scroll). Paced from `draw`, which the event loop calls at least
+    /// once per tick.
+    fn tick_marquee(&mut self) {
+        let Some(item) = self.active_item() else {
+            self.marquee = None;
+            return;
+        };
+        let (item_id, title_len) = (item.id.clone(), item.title.chars().count());
+        if self
+            .marquee
+            .as_ref()
+            .map(|(id, _)| id != &item_id)
+            .unwrap_or(true)
+        {
+            self.marquee = Some((item_id, 0));
+            self.last_marquee = Instant::now();
+            return;
+        }
+        if title_len <= marquee_width() {
+            return;
+        }
+        if self.last_marquee.elapsed() < MARQUEE_INTERVAL {
+            return;
+        }
+        self.last_marquee = Instant::now();
+        let cycle = title_len + MARQUEE_GAP;
+        if let Some((_, off)) = self.marquee.as_mut() {
+            *off = (*off + 1) % cycle;
+        }
+    }
+
+    /// Marquee offset for the selected item's title (0 for other items).
+    fn marquee_offset(&self, item: &UrlItem) -> usize {
+        self.marquee
+            .as_ref()
+            .filter(|(id, _)| id == &item.id)
+            .map(|(_, off)| *off)
+            .unwrap_or(0)
+    }
+
     /// Ask the loader to fetch previews for the cells nearest the cursor,
     /// in order of increasing distance. The cache cap is sized to the visible
     /// grid, so every visible cell is fetched and none is evicted while shown.
@@ -1174,6 +1232,7 @@ impl App {
 
     /// Draw the picker onto the provided frame.
     pub fn draw(&mut self, frame: &mut ratatui::Frame) {
+        self.tick_marquee();
         let area = frame.area();
         let [header_area, grid_area, footer_area] = Layout::default()
             .direction(Direction::Vertical)
@@ -1444,17 +1503,21 @@ impl App {
                             self.focus.is_none(),
                         );
                     }
-                    frame.render_widget(
-                        Paragraph::new(truncate(title, text_area.width)).style(accent),
-                        text_area,
-                    );
+                    let cell_title = if selected {
+                        marquee_window(title, self.marquee_offset(item), text_area.width as usize)
+                    } else {
+                        truncate(title, text_area.width)
+                    };
+                    frame.render_widget(Paragraph::new(cell_title).style(accent), text_area);
                 }
             }
             PreviewMode::Fallback => {
-                frame.render_widget(
-                    Paragraph::new(truncate(title, inner.width)).style(accent),
-                    inner,
-                );
+                let cell_title = if selected {
+                    marquee_window(title, self.marquee_offset(item), inner.width as usize)
+                } else {
+                    truncate(title, inner.width)
+                };
+                frame.render_widget(Paragraph::new(cell_title).style(accent), inner);
             }
         }
     }
@@ -1480,7 +1543,11 @@ impl App {
                 }
             })
             .unwrap_or("☆");
-        let headline = format!("{star} {}", truncate(&title, popup.width.saturating_sub(2)));
+        // Borders + `star ` prefix leave this much of the popup width for
+        // the scrolling title.
+        let title_w = popup.width.saturating_sub(4) as usize;
+        let scroll = self.marquee.as_ref().map(|(_, off)| *off).unwrap_or(0);
+        let headline = format!("{star} {}", marquee_window(&title, scroll, title_w));
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1536,6 +1603,34 @@ fn truncate(s: &str, width: u16) -> String {
     let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// Reference window (in chars) deciding whether a title scrolls at all:
+/// the grid text strip below the preview image.
+fn marquee_width() -> usize {
+    PREVIEW_SIZE.width as usize
+}
+
+/// A `width`-char window into `s` at scroll position `offset`, wrapping
+/// around the end (padded with `MARQUEE_GAP` spaces so the tail and head
+/// don't butt together). Short titles are returned unchanged, so this
+/// doubles as the static display.
+fn marquee_window(s: &str, offset: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= width {
+        return s.to_string();
+    }
+    let cycle = chars.len() + MARQUEE_GAP;
+    let start = offset % cycle;
+    (0..width)
+        .map(|i| {
+            let idx = (start + i) % cycle;
+            chars.get(idx).copied().unwrap_or(' ')
+        })
+        .collect()
 }
 
 /// Share of the terminal (in each dimension) covered by the enlarged
@@ -2975,5 +3070,47 @@ mod tests {
         assert!(!covered_by_overlay(Rect::new(0, 12, 9, 7), popup));
         // No overlay: nothing is skipped.
         assert!(!covered_by_overlay(Rect::new(20, 10, 14, 7), None));
+    }
+
+    #[test]
+    fn marquee_window_passes_short_titles_through() {
+        assert_eq!(marquee_window("hi", 7, 10), "hi");
+        // A title exactly the window's width never scrolls.
+        assert_eq!(marquee_window("0123456789", 3, 10), "0123456789");
+        assert_eq!(marquee_window("", 5, 10), "");
+        assert_eq!(marquee_window("hi", 3, 0), "");
+    }
+
+    #[test]
+    fn marquee_window_scrolls_and_wraps() {
+        // The offset slides a fixed-width window over the title…
+        assert_eq!(marquee_window("abcdef", 0, 4), "abcd");
+        assert_eq!(marquee_window("abcdef", 2, 4), "cdef");
+        // …then wraps through the gap (spaces) back to the head.
+        assert_eq!(marquee_window("abcdef", 6, 4), "   a");
+        assert_eq!(marquee_window("abcdef", 7, 4), "  ab");
+        // Offsets past the cycle length stay in range.
+        assert_eq!(marquee_window("abcdef", 9, 4), marquee_window("abcdef", 0, 4));
+    }
+
+    #[test]
+    fn marquee_resets_when_selection_changes() {
+        let mut app = test_app(items(3));
+        // A long title overflows the strip, so the marquee is active.
+        app.search.items[0].title = "a very long title that overflows the cell".into();
+        app.tick_marquee();
+        assert_eq!(app.marquee_offset(&app.search.items[0]), 0);
+        // Another tick past the interval advances the offset.
+        app.last_marquee -= MARQUEE_INTERVAL;
+        app.tick_marquee();
+        assert_eq!(app.marquee_offset(&app.search.items[0]), 1);
+        // Moving to another item resets the offset to 0.
+        app.search.selected = 1;
+        app.tick_marquee();
+        assert_eq!(app.marquee_offset(&app.search.items[1]), 0);
+        // And back: the first item's marquee restarts.
+        app.search.selected = 0;
+        app.tick_marquee();
+        assert_eq!(app.marquee_offset(&app.search.items[0]), 0);
     }
 }
