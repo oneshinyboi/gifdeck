@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -663,6 +663,38 @@ impl App {
         if let PreviewMode::Graphics { cache, .. } = &self.mode {
             cache.lock().unwrap().clear();
         }
+        // The item list is being replaced entirely; its bytes are no
+        // longer worth keeping around.
+        preview::bytes_store_clear();
+    }
+
+    /// Drop all preview bookkeeping (grid + enlarged) so the next draws
+    /// re-request and re-transmit fresh images. Paired with a terminal-
+    /// side image purge (kitty range-delete) when the estimated image
+    /// budget is exceeded: the old terminal images are freed, and the raw
+    /// bytes store lets everything rebuild without re-fetching.
+    fn purge_previews(&mut self) {
+        if let PreviewMode::Graphics {
+            cache, focus_cache, ..
+        } = &self.mode
+        {
+            cache.lock().unwrap().clear();
+            focus_cache.lock().unwrap().clear();
+        }
+    }
+
+    /// Whether no preview loads are in flight anywhere. Budget purges are
+    /// deferred until idle: a purge mid-load would reset every visible
+    /// gif while more loads keep landing, reading as flicker.
+    fn previews_idle(&self) -> bool {
+        match &self.mode {
+            PreviewMode::Graphics {
+                cache, focus_cache, ..
+            } => {
+                cache.lock().unwrap().loading_len() + focus_cache.lock().unwrap().loading_len() == 0
+            }
+            PreviewMode::Fallback => true,
+        }
     }
 
     /// Swap the active grid for a new page of items: reset the cursor to
@@ -1184,7 +1216,13 @@ impl App {
             );
         } else {
             self.request_previews();
-            self.render_grid(frame, grid_area);
+            // While the overlay is open, don't render the grid cells it
+            // covers (see covered_by_overlay).
+            let popup = self
+                .focus
+                .is_some()
+                .then(|| centered_rect(area, ENLARGED_PERCENT, ENLARGED_PERCENT));
+            self.render_grid(frame, grid_area, popup);
         }
 
         let (fallback_note, loaded, requested, failed) = match &self.mode {
@@ -1214,8 +1252,17 @@ impl App {
             .as_ref()
             .map(|pager| format!(" · {}", page_label(self.grid().page, pager.total())))
             .unwrap_or_default();
+        let budget_note = if matches!(self.mode, PreviewMode::Graphics { .. }) {
+            format!(
+                " · img {}/{}MB",
+                preview::transmitted_image_bytes() / (1024 * 1024),
+                preview::IMAGE_BUDGET_BYTES / (1024 * 1024)
+            )
+        } else {
+            String::new()
+        };
         let nav_line = format!(
-            "{} items{page_note} · ←↑↓→ / hjkl move · u/d page · p enlarge · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}",
+            "{} items{page_note} · ←↑↓→ / hjkl move · u/d page · p enlarge · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}{budget_note}",
             self.grid().items.len()
         );
         let status_note = self
@@ -1323,7 +1370,7 @@ impl App {
         }
     }
 
-    fn render_grid(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn render_grid(&self, frame: &mut ratatui::Frame, area: Rect, popup: Option<Rect>) {
         let cols = (self.cols as usize).max(1);
         let rows = (self.rows as usize).max(1);
         let cell_h = cell_height();
@@ -1341,7 +1388,11 @@ impl App {
             if width == 0 || height == 0 {
                 continue;
             }
-            self.render_cell(frame, Rect::new(x, y, width, height), idx);
+            let cell = Rect::new(x, y, width, height);
+            if covered_by_overlay(cell, popup) {
+                continue;
+            }
+            self.render_cell(frame, cell, idx);
         }
     }
 
@@ -1388,7 +1439,19 @@ impl App {
                         .constraints([Constraint::Length(image_h), Constraint::Min(1)])
                         .areas(inner);
                     if !item.preview_url.is_empty() {
-                        preview::render_preview(frame, img_area, cache, &item.preview_url, false);
+                        // The grid freezes under the overlay: each rendered
+                        // frame becomes a terminal-side image, and still-
+                        // loading gifs transmitting full animations while
+                        // the overlay's large frames are in flight is what
+                        // pushed kitty/ghostty over their image budget.
+                        preview::render_preview(
+                            frame,
+                            img_area,
+                            cache,
+                            &item.preview_url,
+                            false,
+                            self.focus.is_none(),
+                        );
                     }
                     frame.render_widget(
                         Paragraph::new(truncate(title, text_area.width)).style(accent),
@@ -1459,6 +1522,21 @@ impl App {
     }
 }
 
+/// Whether a grid cell is covered by the enlarged overlay and must not be
+/// drawn at all. Image protocols mark a frame as transmitted the moment
+/// the widget renders into the buffer; a frame first rendered into cells
+/// the overlay then overwrites (Clear runs later in the same draw) would
+/// be flagged transmitted without its escape ever reaching the terminal —
+/// a permanently blank animation frame, i.e. gifs flickering in and out
+/// after the overlay closes. Skipping covered cells keeps every
+/// transmission intact.
+fn covered_by_overlay(cell: Rect, popup: Option<Rect>) -> bool {
+    match popup {
+        Some(popup) => cell.intersects(popup),
+        None => false,
+    }
+}
+
 fn truncate(s: &str, width: u16) -> String {
     let w = width as usize;
     if s.chars().count() <= w {
@@ -1505,9 +1583,16 @@ pub async fn run(mut app: App) -> Result<Option<String>> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
+    let mut image_purge_supported = false;
     if io::stdin().is_terminal() {
         match Picker::from_query_stdio() {
             Ok(picker) if picker.protocol_type() != ProtocolType::Halfblocks => {
+                // Terminal-side images are only reclaimable via the kitty
+                // protocol's range delete; tmux swallows raw APC escapes,
+                // so purging is only safe on a bare kitty-protocol
+                // terminal (ghostty included).
+                image_purge_supported = picker.protocol_type() == ProtocolType::Kitty
+                    && std::env::var_os("TMUX").is_none();
                 let client = reqwest::Client::builder()
                     .timeout(Duration::from_secs(10))
                     .build()
@@ -1567,6 +1652,37 @@ pub async fn run(mut app: App) -> Result<Option<String>> {
             // downloads) between event polls.
             app.drain_jobs().await;
             terminal.draw(|f| app.draw(f))?;
+
+            // Terminal image budget: every transmitted frame is immortal
+            // terminal-side (kitty virtual placements need an explicit
+            // delete), so past the budget the terminal starts reclaiming
+            // the oldest placed images — the visible gifs — which show up
+            // as permanent flicker. Purge instead: range-delete every
+            // terminal image, drop our caches, and let the next draws
+            // re-transmit fresh ones (raw bytes are kept, so no refetch).
+            // Deferred until the loader is idle and the overlay is closed:
+            // a purge mid-load would reset every gif while more keep
+            // landing (and re-record the overlay's own ~tens of MB),
+            // re-crossing the budget — a purge-rebuild loop that reads
+            // exactly like flicker.
+            if image_purge_supported
+                && preview::image_budget_exceeded()
+                && app.previews_idle()
+                && app.focus.is_none()
+            {
+                let mut out = io::stdout();
+                // kitty graphics range delete: every image id, freeing
+                // the stored data. q=2 suppresses the terminal response.
+                write!(out, "\x1b_Ga=d,d=R,x=1,y=4294967295,q=2\x1b\\")?;
+                out.flush()?;
+                // Force a full repaint so image placeholder cells are
+                // re-emitted for the fresh transmissions.
+                terminal.clear()?;
+                app.purge_previews();
+                preview::reset_image_budget();
+                app.set_status("image cache rebuilt — reloading previews…");
+            }
+
             if event::poll(tick)? {
                 if let Event::Key(key) = event::read()? {
                     app.handle_key(key);
@@ -2786,5 +2902,87 @@ mod tests {
         let mut app = test_app(Vec::new());
         app.handle_key(key(KeyCode::Char('p')));
         assert!(app.focus.is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_clears_both_preview_caches_but_keeps_bytes() {
+        let cache = Arc::new(Mutex::new(PreviewCache::new(4)));
+        let focus_cache = Arc::new(Mutex::new(PreviewCache::new(4)));
+        cache.lock().unwrap().try_request("u");
+        focus_cache.lock().unwrap().try_request("u#10x5");
+        preview::bytes_store_put("u", &Arc::new(vec![1, 2, 3]));
+        let loader = PreviewLoader::new(
+            reqwest::Client::new(),
+            Arc::clone(&cache),
+            Arc::clone(&focus_cache),
+            Picker::halfblocks(),
+        );
+        let mut app = test_app(items(1));
+        app.enable_previews(Arc::clone(&cache), Arc::clone(&focus_cache), loader);
+
+        app.purge_previews();
+
+        assert_eq!(cache.lock().unwrap().len(), 0, "grid cache purged");
+        assert_eq!(focus_cache.lock().unwrap().len(), 0, "focus cache purged");
+        // Raw bytes survive the purge so the rebuild skips the network.
+        assert!(preview::bytes_store_get("u").is_some());
+        preview::bytes_store_clear();
+    }
+
+    #[test]
+    fn clear_previews_also_clears_bytes_store() {
+        preview::bytes_store_put("u", &Arc::new(vec![1]));
+        test_app(items(1)).clear_previews();
+        assert!(preview::bytes_store_get("u").is_none());
+    }
+
+    #[test]
+    fn overlay_open_tracks_focus() {
+        let mut app = test_app(items(1));
+        assert!(!app.focus.is_some());
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.focus.is_some());
+        // The purge gate requires the overlay to be closed.
+        assert!(app.focus.is_some());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.focus.is_some());
+    }
+
+    #[test]
+    fn previews_idle_without_graphics_mode() {
+        // Fallback mode never has in-flight loads.
+        assert!(test_app(items(1)).previews_idle());
+    }
+
+    #[tokio::test]
+    async fn previews_idle_reflects_in_flight_loads() {
+        let cache = Arc::new(Mutex::new(PreviewCache::new(4)));
+        let focus_cache = Arc::new(Mutex::new(PreviewCache::new(4)));
+        cache.lock().unwrap().try_request("u");
+        let loader = PreviewLoader::new(
+            reqwest::Client::new(),
+            Arc::clone(&cache),
+            Arc::clone(&focus_cache),
+            Picker::halfblocks(),
+        );
+        let mut app = test_app(items(1));
+        app.enable_previews(cache, focus_cache, loader);
+        assert!(!app.previews_idle(), "in-flight load blocks the purge");
+    }
+
+    #[test]
+    fn covered_by_overlay_matches_intersecting_cells() {
+        let popup = Some(Rect::new(10, 5, 80, 40));
+        // Fully covered.
+        assert!(covered_by_overlay(Rect::new(20, 10, 14, 7), popup));
+        // Partially intersecting is covered too (its covered cells would
+        // swallow the row's transmission).
+        assert!(covered_by_overlay(Rect::new(5, 3, 14, 7), popup));
+        assert!(covered_by_overlay(Rect::new(80, 5, 14, 7), popup));
+        // Outside stays rendered.
+        assert!(!covered_by_overlay(Rect::new(0, 0, 9, 4), popup));
+        assert!(!covered_by_overlay(Rect::new(0, 12, 9, 7), popup));
+        // No overlay: nothing is skipped.
+        assert!(!covered_by_overlay(Rect::new(20, 10, 14, 7), None));
     }
 }

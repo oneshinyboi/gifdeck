@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -18,6 +19,11 @@ use tokio::sync::mpsc;
 /// somehow larger than this.
 pub const MAX_CACHE_CAP: usize = 4096;
 pub const MAX_FRAMES: usize = 24;
+/// Frame cap for enlarged (overlay) decodes: every frame is a terminal-
+/// side image that outlives our caches, so the full-window animation
+/// stays at a fraction of the grid's count to keep the image budget
+/// (and decode time) sane on large terminals.
+pub const FOCUS_MAX_FRAMES: usize = 8;
 pub const PREVIEW_SIZE: Size = Size::new(12, 4);
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(40);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,6 +36,9 @@ pub struct CachedPreview {
     /// Raw GIF bytes, kept so the enlarged view can re-decode at a bigger
     /// size without re-fetching.
     bytes: Arc<Vec<u8>>,
+    /// Estimated terminal-side bytes this entry occupies once every frame
+    /// has been transmitted (from the actual decoded frame pixel size).
+    terminal_bytes: u64,
 }
 
 impl CachedPreview {
@@ -37,6 +46,15 @@ impl CachedPreview {
         let elapsed = now.saturating_duration_since(self.loaded_at);
         let idx = frame_index(&self.delays, elapsed);
         &self.frames[idx.min(self.frames.len().saturating_sub(1))]
+    }
+
+    /// First frame, for static rendering while grid animation is frozen
+    /// under the enlarged overlay (each rendered frame is a terminal-side
+    /// image; freezing stops still-loading gifs from transmitting a full
+    /// animation's worth while the overlay's large frames dominate the
+    /// terminal's image budget).
+    pub fn first_frame(&self) -> Option<&Protocol> {
+        self.frames.first()
     }
 
     #[cfg(test)]
@@ -327,12 +345,19 @@ async fn load_preview(
     picker: &Picker,
     cache: &Arc<Mutex<PreviewCache>>,
 ) {
-    let bytes = match fetch_bytes(client, url).await {
-        Ok(b) => b,
-        Err(e) => {
-            cache.lock().unwrap().insert_failed(url, format!("{e:#}"));
-            return;
-        }
+    let bytes = match bytes_store_get(url) {
+        Some(b) => b,
+        None => match fetch_bytes(client, url).await {
+            Ok(b) => {
+                let b = Arc::new(b);
+                bytes_store_put(url, &b);
+                b
+            }
+            Err(e) => {
+                cache.lock().unwrap().insert_failed(url, format!("{e:#}"));
+                return;
+            }
+        },
     };
 
     let picker = picker.clone();
@@ -342,7 +367,10 @@ async fn load_preview(
 
     let mut guard = cache.lock().unwrap();
     match result {
-        Ok(Ok(Some(cached))) => guard.insert_ready(url, cached),
+        Ok(Ok(Some(cached))) => {
+            record_image_bytes(cached.terminal_bytes);
+            guard.insert_ready(url, cached)
+        }
         Ok(Ok(None)) => guard.insert_failed(url, "not a gif".to_string()),
         Ok(Err(e)) => guard.insert_failed(url, format!("{e:#}")),
         Err(e) => guard.insert_failed(url, e.to_string()),
@@ -368,11 +396,16 @@ async fn load_focus(
             }
             _ => None,
         }
-    };
+    }
+    .or_else(|| bytes_store_get(url));
     let bytes = match cached_bytes {
         Some(b) => b,
         None => match fetch_bytes(client, url).await {
-            Ok(b) => Arc::new(b),
+            Ok(b) => {
+                let b = Arc::new(b);
+                bytes_store_put(url, &b);
+                b
+            }
             Err(e) => {
                 let key = focus_key(url, size);
                 focus_cache
@@ -385,15 +418,19 @@ async fn load_focus(
     };
 
     let picker = picker.clone();
-    let result =
-        tokio::task::spawn_blocking(move || decode_preview_at(&bytes, &picker, size, FOCUS_RESIZE))
-            .await
-            .map_err(|e| anyhow::anyhow!("decode task failed: {e}"));
+    let result = tokio::task::spawn_blocking(move || {
+        decode_preview_at(&bytes, &picker, size, FOCUS_RESIZE, FOCUS_MAX_FRAMES)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("decode task failed: {e}"));
 
     let key = focus_key(url, size);
     let mut guard = focus_cache.lock().unwrap();
     match result {
-        Ok(Ok(Some(cached))) => guard.insert_ready(&key, cached),
+        Ok(Ok(Some(cached))) => {
+            record_image_bytes(cached.terminal_bytes);
+            guard.insert_ready(&key, cached)
+        }
         Ok(Ok(None)) => guard.insert_failed(&key, "not a gif".to_string()),
         Ok(Err(e)) => guard.insert_failed(&key, format!("{e:#}")),
         Err(e) => guard.insert_failed(&key, e.to_string()),
@@ -409,7 +446,7 @@ const GRID_RESIZE: Resize = Resize::Fit(None);
 const FOCUS_RESIZE: Resize = Resize::Scale(Some(FilterType::Triangle));
 
 pub fn decode_preview(bytes: &[u8], picker: &Picker) -> Result<Option<CachedPreview>> {
-    decode_preview_at(bytes, picker, PREVIEW_SIZE, GRID_RESIZE)
+    decode_preview_at(bytes, picker, PREVIEW_SIZE, GRID_RESIZE, MAX_FRAMES)
 }
 
 /// Decode a GIF into cached frames fitted to `size` cells (used for both
@@ -419,6 +456,7 @@ pub fn decode_preview_at(
     picker: &Picker,
     size: Size,
     resize: Resize,
+    max_frames: usize,
 ) -> Result<Option<CachedPreview>> {
     if !bytes.starts_with(GIF_MAGIC) {
         return Ok(None);
@@ -426,8 +464,12 @@ pub fn decode_preview_at(
     let decoder = GifDecoder::new(Cursor::new(bytes))?;
     let mut frames = Vec::new();
     let mut delays = Vec::new();
-    for frame in decoder.into_frames().take(MAX_FRAMES) {
+    let mut natural: Option<(u32, u32)> = None;
+    for frame in decoder.into_frames().take(max_frames) {
         let frame = frame?;
+        if natural.is_none() {
+            natural = Some((frame.buffer().width(), frame.buffer().height()));
+        }
         let dyn_img: DynamicImage = frame.buffer().clone().into();
         let protocol = picker.new_protocol(dyn_img, size, resize.clone())?;
         let (numer, denom) = frame.delay().numer_denom_ms();
@@ -438,11 +480,25 @@ pub fn decode_preview_at(
     if frames.is_empty() {
         return Ok(None);
     }
+    // Ledger estimate from the pixel size actually transmitted: Fit
+    // keeps a small source at natural size, Scale fits the target.
+    let cell_px = cell_pixel_size();
+    let target = (
+        size.width as u64 * cell_px.0 as u64,
+        size.height as u64 * cell_px.1 as u64,
+    );
+    let upscale = matches!(resize, Resize::Scale(_));
+    let (nw, nh) = natural.unwrap_or((0, 0));
+    let terminal_bytes = image_bytes(
+        fitted_pixels((nw as u64, nh as u64), target, upscale),
+        frames.len(),
+    );
     Ok(Some(CachedPreview {
         frames,
         delays,
         loaded_at: Instant::now(),
         bytes: Arc::new(bytes.to_vec()),
+        terminal_bytes,
     }))
 }
 
@@ -452,13 +508,14 @@ pub fn render_preview(
     cache: &Arc<Mutex<PreviewCache>>,
     url: &str,
     center: bool,
+    animate: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let guard = cache.lock().unwrap();
     match guard.get(url) {
-        Some(PreviewEntry::Ready(cached)) => render_entry(frame, area, cached, center),
+        Some(PreviewEntry::Ready(cached)) => render_entry(frame, area, cached, center, animate),
         _ => render_placeholder(frame, area, url),
     }
 }
@@ -484,13 +541,22 @@ pub fn render_focus_preview(
         _ => guard.newest_ready_for(url),
     };
     match cached {
-        Some(cached) => render_entry(frame, area, cached, true),
+        Some(cached) => render_entry(frame, area, cached, true, true),
         None => render_placeholder(frame, area, url),
     }
 }
 
-fn render_entry(frame: &mut ratatui::Frame, area: Rect, cached: &CachedPreview, center: bool) {
-    let protocol = cached.frame(Instant::now());
+fn render_entry(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    cached: &CachedPreview,
+    center: bool,
+    animate: bool,
+) {
+    let protocol = match cached.first_frame() {
+        Some(p) if !animate => p,
+        _ => cached.frame(Instant::now()),
+    };
     let area = if center {
         centered_area(area, protocol.size())
     } else {
@@ -536,6 +602,161 @@ pub fn preview_stats(cache: &Arc<Mutex<PreviewCache>>) -> (usize, usize, usize) 
         }
     }
     (loaded, requested, failed)
+}
+
+// ---------------------------------------------------------------------------
+// Terminal image budget
+//
+// Every decoded frame becomes a terminal-side image that outlives our host
+// caches: the kitty protocol's virtual placements are only removed by an
+// explicit delete command, so "placed" images accumulate forever. Once the
+// terminal's storage quota is hit (kitty: 320MB per buffer), it reclaims the
+// oldest *placed* images — the visible gifs — and since protocols transmit
+// once, the affected frames stay blank (the flicker). We track an estimate
+// of transmitted bytes and let the event loop purge + rebuild past a
+// conservative budget.
+// ---------------------------------------------------------------------------
+
+/// Estimated terminal-side image bytes we are willing to accumulate before
+// purging. Half of kitty's documented 320MB quota, leaving room for
+/// estimate error and anything else sharing the terminal.
+pub const IMAGE_BUDGET_BYTES: u64 = 160 * 1024 * 1024;
+
+static TRANSMITTED_IMAGE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Add `bytes` to the transmitted-image ledger.
+pub fn record_image_bytes(bytes: u64) {
+    TRANSMITTED_IMAGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Whether the accumulated estimate has crossed the budget.
+pub fn image_budget_exceeded() -> bool {
+    TRANSMITTED_IMAGE_BYTES.load(Ordering::Relaxed) >= IMAGE_BUDGET_BYTES
+}
+
+/// Current ledger value (bytes), for the footer readout.
+pub fn transmitted_image_bytes() -> u64 {
+    TRANSMITTED_IMAGE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Zero the ledger (after a purge wiped the terminal's images).
+pub fn reset_image_budget() {
+    TRANSMITTED_IMAGE_BYTES.store(0, Ordering::Relaxed);
+}
+
+/// Cell size in pixels (from the tty window metrics), with a sane fallback.
+fn cell_pixel_size() -> (u16, u16) {
+    match crossterm::terminal::window_size() {
+        Ok(ws) if ws.columns > 0 && ws.rows > 0 => (ws.width / ws.columns, ws.height / ws.rows),
+        _ => (10, 20),
+    }
+}
+
+/// Resulting pixel dimensions when an image of `natural` size is fitted to
+/// a pixel `target`: `Scale` always resizes to fit (up or down); `Fit`
+/// never upscales, keeping the natural size when it already fits. Mirrors
+/// ratatui-image's resize semantics so the ledger tracks what is actually
+/// transmitted instead of a worst-case guess.
+fn fitted_pixels(natural: (u64, u64), target: (u64, u64), upscale: bool) -> (u64, u64) {
+    let (nw, nh) = (natural.0.max(1), natural.1.max(1));
+    let (tw, th) = target;
+    if tw == 0 || th == 0 {
+        return (0, 0);
+    }
+    if !upscale && nw <= tw && nh <= th {
+        return (nw, nh);
+    }
+    let scale = (tw as f64 / nw as f64).min(th as f64 / nh as f64);
+    (
+        ((nw as f64 * scale).floor() as u64).max(1),
+        ((nh as f64 * scale).floor() as u64).max(1),
+    )
+}
+
+/// RGBA bytes for `frames` frames of a `px`-sized image.
+fn image_bytes(px: (u64, u64), frames: usize) -> u64 {
+    px.0.saturating_mul(px.1)
+        .saturating_mul(4)
+        .saturating_mul(frames as u64)
+}
+
+// ---------------------------------------------------------------------------
+// Raw-bytes store
+//
+// Keeps fetched GIF bytes across cache purges so a purge-rebuild re-decodes
+// without re-fetching. Cleared with the item list (page/tab change) to
+// bound host memory.
+// ---------------------------------------------------------------------------
+
+const BYTES_STORE_CAP: usize = 128;
+
+struct BytesStore {
+    map: HashMap<String, Arc<Vec<u8>>>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl BytesStore {
+    fn new(cap: usize) -> Self {
+        BytesStore {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn get(&mut self, url: &str) -> Option<Arc<Vec<u8>>> {
+        let bytes = self.map.get(url)?;
+        let bytes = Arc::clone(bytes);
+        if let Some(pos) = self.order.iter().position(|u| u == url) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(url.to_string());
+        Some(bytes)
+    }
+
+    fn put(&mut self, url: &str, bytes: Arc<Vec<u8>>) {
+        if url.is_empty() {
+            return;
+        }
+        self.map.insert(url.to_string(), bytes);
+        if let Some(pos) = self.order.iter().position(|u| u == url) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(url.to_string());
+        while self.map.len() > self.cap {
+            let oldest = self.order.pop_front().expect("order mirrors map keys");
+            self.map.remove(&oldest);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+static BYTES_STORE: OnceLock<Mutex<BytesStore>> = OnceLock::new();
+
+fn bytes_store() -> &'static Mutex<BytesStore> {
+    BYTES_STORE.get_or_init(|| Mutex::new(BytesStore::new(BYTES_STORE_CAP)))
+}
+
+pub fn bytes_store_get(url: &str) -> Option<Arc<Vec<u8>>> {
+    bytes_store().lock().unwrap().get(url)
+}
+
+pub fn bytes_store_put(url: &str, bytes: &Arc<Vec<u8>>) {
+    bytes_store().lock().unwrap().put(url, Arc::clone(bytes));
+}
+
+pub fn bytes_store_clear() {
+    bytes_store().lock().unwrap().clear();
 }
 
 #[cfg(test)]
@@ -611,6 +832,7 @@ mod tests {
                 delays: Vec::new(),
                 loaded_at: Instant::now(),
                 bytes: Arc::new(Vec::new()),
+                terminal_bytes: 0,
             },
         );
         c.insert_failed("a", "boom".to_string());
@@ -623,6 +845,7 @@ mod tests {
             delays: Vec::new(),
             loaded_at: Instant::now(),
             bytes: Arc::new(Vec::new()),
+            terminal_bytes: 0,
         }
     }
 
@@ -643,6 +866,7 @@ mod tests {
                 delays: vec![Duration::from_millis(100)],
                 loaded_at: Instant::now(),
                 bytes: Arc::new(Vec::new()),
+                terminal_bytes: 0,
             },
         );
         c.insert_ready("b", empty_cached());
@@ -710,6 +934,7 @@ mod tests {
                 delays: Vec::new(),
                 loaded_at: Instant::now(),
                 bytes: Arc::new(Vec::new()),
+                terminal_bytes: 0,
             },
         );
         assert!(!c.try_request("b"), "ready entries are not refetched");
@@ -721,26 +946,35 @@ mod tests {
         let png = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         assert!(decode_preview(&png, &picker).unwrap().is_none());
         assert!(decode_preview(b"", &picker).unwrap().is_none());
-        assert!(
-            decode_preview_at(&png, &picker, Size::new(40, 20), FOCUS_RESIZE)
-                .unwrap()
-                .is_none()
-        );
+        assert!(decode_preview_at(
+            &png,
+            &picker,
+            Size::new(40, 20),
+            FOCUS_RESIZE,
+            FOCUS_MAX_FRAMES
+        )
+        .unwrap()
+        .is_none());
     }
 
-    fn two_frame_gif() -> Vec<u8> {
+    fn gif_with_frames(n: usize) -> Vec<u8> {
         let mut gif_bytes = Vec::new();
         {
             let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif_bytes);
             encoder
                 .set_repeat(image::codecs::gif::Repeat::Infinite)
                 .unwrap();
-            let f1: image::RgbaImage = ImageBuffer::from_pixel(20, 10, Rgba([10, 10, 10, 255]));
-            let f2: image::RgbaImage = ImageBuffer::from_pixel(20, 10, Rgba([200, 200, 200, 255]));
-            encoder.encode_frame(image::Frame::new(f1)).unwrap();
-            encoder.encode_frame(image::Frame::new(f2)).unwrap();
+            for i in 0..n {
+                let v = if i % 2 == 0 { 10 } else { 200 };
+                let f: image::RgbaImage = ImageBuffer::from_pixel(20, 10, Rgba([v, v, v, 255]));
+                encoder.encode_frame(image::Frame::new(f)).unwrap();
+            }
         }
         gif_bytes
+    }
+
+    fn two_frame_gif() -> Vec<u8> {
+        gif_with_frames(2)
     }
 
     #[test]
@@ -757,14 +991,61 @@ mod tests {
     fn decode_preview_at_larger_size_keeps_frames_and_bytes() {
         let picker = Picker::halfblocks();
         let gif_bytes = two_frame_gif();
-        let cached = decode_preview_at(&gif_bytes, &picker, Size::new(40, 20), FOCUS_RESIZE)
-            .unwrap()
-            .expect("should decode");
+        let cached = decode_preview_at(
+            &gif_bytes,
+            &picker,
+            Size::new(40, 20),
+            FOCUS_RESIZE,
+            FOCUS_MAX_FRAMES,
+        )
+        .unwrap()
+        .expect("should decode");
         assert_eq!(cached.frame_count(), 2);
         assert_eq!(cached.raw_bytes().as_slice(), gif_bytes.as_slice());
         // The enlarged decode fits within the requested cell size.
         let size = cached.frame(Instant::now()).size();
         assert!(size.width <= 40 && size.height <= 20);
+    }
+
+    #[test]
+    fn focus_decode_caps_frames_for_terminal_budget() {
+        let picker = Picker::halfblocks();
+        let gif_bytes = gif_with_frames(20);
+        // Grid decode keeps the whole animation (up to the cap)…
+        let grid = decode_preview_at(&gif_bytes, &picker, PREVIEW_SIZE, GRID_RESIZE, MAX_FRAMES)
+            .unwrap()
+            .expect("should decode");
+        assert_eq!(grid.frame_count(), 20);
+        // …while the enlarged overlay decode is capped at a fraction: every
+        // frame is a terminal-side image that outlives our caches, so large
+        // decodes must stay lean.
+        let focus = decode_preview_at(
+            &gif_bytes,
+            &picker,
+            Size::new(40, 20),
+            FOCUS_RESIZE,
+            FOCUS_MAX_FRAMES,
+        )
+        .unwrap()
+        .expect("should decode");
+        assert_eq!(focus.frame_count(), FOCUS_MAX_FRAMES);
+    }
+
+    #[test]
+    fn first_frame_is_stable_for_frozen_render() {
+        let picker = Picker::halfblocks();
+        let cached = decode_preview(&two_frame_gif(), &picker)
+            .unwrap()
+            .expect("should decode");
+        let first = cached.first_frame().expect("decoded previews have frames");
+        // The frozen frame never advances with time.
+        assert!(std::ptr::eq(
+            first,
+            cached.first_frame().expect("decoded previews have frames")
+        ));
+        assert!(std::ptr::eq(first, &cached.frames[0]));
+        // Empty (test-only) previews have no still frame.
+        assert!(empty_cached().first_frame().is_none());
     }
 
     #[test]
@@ -775,9 +1056,15 @@ mod tests {
         // Fit: the 20x10px source already fits 40x20 cells, so it stays at
         // its natural size (this was the "tiny gif in the overlay corner"
         // bug).
-        let fitted = decode_preview_at(&gif_bytes, &picker, Size::new(40, 20), GRID_RESIZE)
-            .unwrap()
-            .expect("should decode");
+        let fitted = decode_preview_at(
+            &gif_bytes,
+            &picker,
+            Size::new(40, 20),
+            GRID_RESIZE,
+            MAX_FRAMES,
+        )
+        .unwrap()
+        .expect("should decode");
         let fitted_size = fitted.frame(Instant::now()).size();
         assert!(
             fitted_size.width < 40,
@@ -785,9 +1072,15 @@ mod tests {
         );
 
         // Scale: the same source is upscaled towards the requested size.
-        let scaled = decode_preview_at(&gif_bytes, &picker, Size::new(40, 20), FOCUS_RESIZE)
-            .unwrap()
-            .expect("should decode");
+        let scaled = decode_preview_at(
+            &gif_bytes,
+            &picker,
+            Size::new(40, 20),
+            FOCUS_RESIZE,
+            FOCUS_MAX_FRAMES,
+        )
+        .unwrap()
+        .expect("should decode");
         let scaled_size = scaled.frame(Instant::now()).size();
         assert!(
             scaled_size.width > fitted_size.width,
@@ -839,6 +1132,7 @@ mod tests {
             delays: vec![Duration::from_millis(100)],
             loaded_at: Instant::now(),
             bytes: Arc::new(Vec::new()),
+            terminal_bytes: 0,
         }
     }
 
@@ -949,5 +1243,77 @@ mod tests {
             "stale entries trimmed, got {}",
             c.len()
         );
+    }
+
+    #[test]
+    fn fitted_pixels_mirrors_fit_and_scale_semantics() {
+        // Fit never upscales: a small source stays at natural size.
+        assert_eq!(fitted_pixels((50, 50), (96, 64), false), (50, 50));
+        // Fit downscales proportionally within the target.
+        assert_eq!(fitted_pixels((300, 300), (96, 64), false), (64, 64));
+        assert_eq!(fitted_pixels((2000, 1000), (96, 64), false), (96, 48));
+        // Scale always fits the target, up or down.
+        assert_eq!(fitted_pixels((20, 10), (320, 160), true), (320, 160));
+        assert_eq!(fitted_pixels((300, 300), (96, 64), true), (64, 64));
+        // Zero target yields zero bytes later.
+        assert_eq!(fitted_pixels((50, 50), (0, 64), false), (0, 0));
+    }
+
+    #[test]
+    fn image_bytes_is_rgba_per_frame() {
+        assert_eq!(image_bytes((100, 50), 3), 100 * 50 * 4 * 3);
+        assert_eq!(image_bytes((0, 0), 24), 0);
+        assert_eq!(
+            image_bytes((u64::MAX / 2, u64::MAX / 2), usize::MAX),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn decode_records_honest_terminal_estimate() {
+        let picker = Picker::halfblocks();
+        let cached = decode_preview(&two_frame_gif(), &picker)
+            .unwrap()
+            .expect("should decode");
+        // Natural size 20x10px fits the PREVIEW_SIZE target pixels, so a
+        // Fit decode transmits at natural size.
+        let cell_px = cell_pixel_size();
+        let target = (
+            PREVIEW_SIZE.width as u64 * cell_px.0 as u64,
+            PREVIEW_SIZE.height as u64 * cell_px.1 as u64,
+        );
+        let expected = image_bytes(fitted_pixels((20, 10), target, false), 2);
+        assert_eq!(cached.terminal_bytes, expected);
+        assert!(expected > 0);
+    }
+
+    #[test]
+    fn image_budget_trips_and_resets() {
+        reset_image_budget();
+        assert!(!image_budget_exceeded());
+        record_image_bytes(IMAGE_BUDGET_BYTES);
+        assert!(image_budget_exceeded());
+        reset_image_budget();
+        assert!(!image_budget_exceeded());
+    }
+
+    #[test]
+    fn bytes_store_evicts_lru_and_clears() {
+        let mut store = BytesStore::new(3);
+        for k in ["a", "b", "c"] {
+            store.put(k, Arc::new(vec![1]));
+        }
+        assert!(store.get("a").is_some(), "present");
+        // "b" is now the least recently used; inserting "d" evicts it.
+        store.put("d", Arc::new(vec![2]));
+        assert_eq!(store.len(), 3);
+        assert!(store.get("b").is_none(), "lru entry evicted");
+        assert!(store.get("d").is_some());
+        // Empty urls are not stored.
+        store.put("", Arc::new(vec![3]));
+        assert_eq!(store.len(), 3);
+        store.clear();
+        assert_eq!(store.len(), 0);
+        assert!(store.get("a").is_none());
     }
 }
