@@ -1,6 +1,6 @@
 [package]
 name = "gifdeck"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A Rust + ratatui GIF picker backed by GIPHY/KLIPY and a self-hosted favorites server"
 license = "GPL-3.0-only"
