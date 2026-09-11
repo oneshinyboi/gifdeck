@@ -1252,17 +1252,8 @@ impl App {
             .as_ref()
             .map(|pager| format!(" · {}", page_label(self.grid().page, pager.total())))
             .unwrap_or_default();
-        let budget_note = if matches!(self.mode, PreviewMode::Graphics { .. }) {
-            format!(
-                " · img {}/{}MB",
-                preview::transmitted_image_bytes() / (1024 * 1024),
-                preview::IMAGE_BUDGET_BYTES / (1024 * 1024)
-            )
-        } else {
-            String::new()
-        };
         let nav_line = format!(
-            "{} items{page_note} · ←↑↓→ / hjkl move · u/d page · p enlarge · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}{budget_note}",
+            "{} items{page_note} · ←↑↓→ / hjkl move · u/d page · p enlarge · Enter/Space pick · q quit{fallback_note}{loaded_note}{requested_note}{failed_note}",
             self.grid().items.len()
         );
         let status_note = self

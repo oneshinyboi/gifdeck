@@ -634,11 +634,6 @@ pub fn image_budget_exceeded() -> bool {
     TRANSMITTED_IMAGE_BYTES.load(Ordering::Relaxed) >= IMAGE_BUDGET_BYTES
 }
 
-/// Current ledger value (bytes), for the footer readout.
-pub fn transmitted_image_bytes() -> u64 {
-    TRANSMITTED_IMAGE_BYTES.load(Ordering::Relaxed)
-}
-
 /// Zero the ledger (after a purge wiped the terminal's images).
 pub fn reset_image_budget() {
     TRANSMITTED_IMAGE_BYTES.store(0, Ordering::Relaxed);
